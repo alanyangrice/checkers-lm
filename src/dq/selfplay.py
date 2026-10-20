@@ -204,7 +204,8 @@ def match(ev_a: NetEvaluator, ev_b: NetEvaluator, games: int, sims: int, tb, rng
         if not live:
             break
         for side_a in (True, False):
-            idx = [i for i in live if (states[i].pos.turn == WHITE) == (a_is_white[i] == side_a)]
+            idx = [i for i in live if not states[i].over
+                   and (states[i].pos.turn == WHITE) == (a_is_white[i] == side_a)]
             if not idx:
                 continue
             m = ma if side_a else mb

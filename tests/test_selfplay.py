@@ -14,12 +14,18 @@ def _net(seed: int) -> SquareTransformer:
     return SquareTransformer(ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128)).eval()
 
 
-def test_batched_match_runs_and_scores_in_range() -> None:
-    rng = random.Random(0)
+def test_batched_match_is_symmetric_and_handles_last_capture() -> None:
+    """Games that end mid-round (a capture of the last piece) must not be
+    searched again; A-vs-B and B-vs-A must mirror (search is deterministic
+    at T=0 without noise)."""
+    tb = Tablebase(); tb.build(3)
     a, b = NetEvaluator(_net(1)), NetEvaluator(_net(2))
-    s = match(a, b, games=6, sims=8, tb=None, rng=rng, max_plies=120)
-    assert 0.0 <= s <= 1.0
-    s_raw = match(a, b, games=4, sims=8, tb=None, rng=rng, max_plies=120, raw_a=True)
+    ab = match(a, b, games=20, sims=16, tb=tb, rng=random.Random(0), max_plies=300)
+    ba = match(b, a, games=20, sims=16, tb=tb, rng=random.Random(0), max_plies=300)
+    assert abs(ab + ba - 1.0) < 1e-9
+    aa = match(a, a, games=10, sims=8, tb=None, rng=random.Random(0), max_plies=300)
+    assert aa == 0.5
+    s_raw = match(a, b, games=4, sims=8, tb=None, rng=random.Random(0), max_plies=120, raw_a=True)
     assert 0.0 <= s_raw <= 1.0
 
 
