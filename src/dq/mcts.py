@@ -54,8 +54,11 @@ class Node:
 
     @property
     def Q(self) -> float:
+        """Mean value for the side to move *at this node*.  An in-flight
+        visit counts as +1 here (a win for this node's mover), which is a
+        loss from the parent's point of view -- that is the virtual loss."""
         n = self.N + self.vloss
-        return (self.W - self.vloss) / n if n else 0.0   # virtual loss counts as -1
+        return (self.W + self.vloss) / n if n else 0.0
 
     @property
     def expanded(self) -> bool:

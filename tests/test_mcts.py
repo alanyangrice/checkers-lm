@@ -99,3 +99,18 @@ def test_tree_reuse_advance() -> None:
     assert child.pos == apply_move(root.pos, mv) and child.N > 0
     m.search(child.pos, root=child, add_noise=False)
     assert child.N >= 30
+
+
+def test_virtual_loss_diversifies_leaves() -> None:
+    """In one batched round the 8 descents from a fresh root must reach
+    8 distinct leaves (virtual loss repels in-flight paths)."""
+    from dq.mcts import Node
+    seen = []
+    def ev(positions, moves):
+        seen.extend(positions)
+        return uniform_evaluator(positions, moves)
+    m = MCTS(ev, SearchConfig(simulations=8, dirichlet_eps=0.0, leaves_per_tree=8), rng=random.Random(0))
+    m.search_batch([Node(Position.start())], add_noise=False)
+    # root first, then one round: the start position has 7 legal moves, so
+    # 8 descents reach all 7 children (the 8th repeats one and is deduped)
+    assert len(seen) == 1 + 7 and len(set(p.fen() for p in seen[1:])) == 7
