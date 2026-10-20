@@ -6,3 +6,4 @@ data/*
 !data/lidraughts_brazilian.pdn
 .pytest_cache/
 .hypothesis/
+runs/

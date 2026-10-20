@@ -76,8 +76,8 @@ FEN-like position string
 - [x] 1,030 rated Brazilian games from top lidraughts players (`data/lidraughts_brazilian.pdn`); all replay through `rules.py`, recorded losers match no-move finals. Numbering/orientation validated on real data.
 
 ### Phase 1 — Expert encoder (weeks 1–3) [ext]
-- [ ] AlphaZero-style self-play loop: MCTS + transformer encoder, policy/WDL heads.
-- [ ] **Auxiliary head: capture-sequence count / max-capture length** during self-play, to keep that information in the residual stream (mitigates Risk 1).
+- [~] AlphaZero-style self-play loop: `dq/game.py` (lidraughts draw rules 7.2.3–7.2.8), `dq/mcts.py` (PUCT, tablebase leaves), `dq/model.py` (32-token transformer, policy/WDL/ncap heads), `dq/selfplay.py` + `scripts/selfplay.py` (generate → train → gate → promote). Smoke-tested end to end on the Mac. Still single-process, unbatched: needs batched leaf eval + multiprocess generation before a real run on the 5090.
+- [x] **Auxiliary head: max-capture length** (`ncap`, weight 0.25) in the model and loss.
 - [ ] Gates:
   - beats own MCTS at 1 node by >80% with search off
   - zero WDL errors on tablebase positions
