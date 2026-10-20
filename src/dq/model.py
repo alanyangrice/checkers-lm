@@ -144,28 +144,47 @@ def loss_fn(out: dict[str, torch.Tensor], batch: dict[str, torch.Tensor],
 # ---------------------------------------------------------------------------
 
 class NetEvaluator:
-    """Single-position evaluator for :class:`dq.mcts.MCTS`.  Batching across
-    tree positions is a later optimisation."""
+    """Batched evaluator for :class:`dq.mcts.MCTS`: one forward pass per call.
 
-    def __init__(self, model: SquareTransformer, device=None) -> None:
+    Values are ``P(win) - P(loss)`` from the WDL head.  Priors are the
+    softmax over the legal (from, to) pairs; moves sharing a pair split its
+    mass equally."""
+
+    def __init__(self, model: SquareTransformer, device=None, autocast: bool = False) -> None:
         self.model = model.eval()
         self.device = device or next(model.parameters()).device
+        self.autocast = autocast and self.device.type == "cuda"
+        self.calls = 0
+        self.positions = 0
 
     @torch.no_grad()
-    def __call__(self, pos: Position, moves: list[Move]) -> tuple[dict[Move, float], float]:
-        ids = torch.tensor([encode_board(pos)], dtype=torch.long, device=self.device)
-        out = self.model(ids)
-        logits = out["policy"][0]
-        idx = [pair_index(pov_move(m, pos.turn)) for m in moves]
-        sel = logits[idx]
-        probs = torch.softmax(sel, dim=0).tolist()
-        # split mass equally among moves sharing a pair index
-        counts: dict[int, int] = {}
-        for k in idx:
-            counts[k] = counts.get(k, 0) + 1
-        prior = {m: p / counts[k] for m, k, p in zip(moves, idx, probs)}
-        z = sum(prior.values()) or 1.0
-        prior = {m: p / z for m, p in prior.items()}
-        wdl = torch.softmax(out["wdl"][0], dim=0)
-        value = float(wdl[WDL_W] - wdl[WDL_L])
-        return prior, value
+    def __call__(self, positions: list[Position], moves: list[list[Move]]) -> list[tuple[dict[Move, float], float]]:
+        B = len(positions)
+        self.calls += 1
+        self.positions += B
+        ids = torch.tensor([encode_board(p) for p in positions], dtype=torch.long, device=self.device)
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=self.autocast):
+            out = self.model(ids)
+        logits = out["policy"].float()
+        wdl = torch.softmax(out["wdl"].float(), dim=-1)
+        values = (wdl[:, WDL_W] - wdl[:, WDL_L]).tolist()
+        # gather legal-pair logits with a padded index matrix and one softmax
+        idx_lists = [[pair_index(pov_move(m, p.turn)) for m in ms] for p, ms in zip(positions, moves)]
+        L = max(len(x) for x in idx_lists)
+        idx = torch.zeros(B, L, dtype=torch.long)
+        mask = torch.full((B, L), float("-inf"))
+        for i, x in enumerate(idx_lists):
+            idx[i, :len(x)] = torch.tensor(x)
+            mask[i, :len(x)] = 0.0
+        idx = idx.to(self.device); mask = mask.to(self.device)
+        sel = logits.gather(1, idx) + mask
+        probs = torch.softmax(sel, dim=-1).cpu().tolist()
+        out_list = []
+        for ms, x, pr in zip(moves, idx_lists, probs):
+            counts: dict[int, int] = {}
+            for k in x:
+                counts[k] = counts.get(k, 0) + 1
+            prior = {m: pr[j] / counts[k] for j, (m, k) in enumerate(zip(ms, x))}
+            z = sum(prior.values()) or 1.0
+            out_list.append(({m: p / z for m, p in prior.items()}, values[len(out_list)]))
+        return out_list

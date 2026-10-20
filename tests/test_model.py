@@ -61,7 +61,7 @@ def test_evaluator_priors_sum_to_one_and_mcts_runs() -> None:
         moves = legal_moves(p)
         if not moves:
             continue
-        prior, v = ev(p, moves)
+        (prior, v), = ev([p], [moves])
         assert abs(sum(prior.values()) - 1.0) < 1e-5 and -1.0 <= v <= 1.0
     s = MCTS(ev, SearchConfig(simulations=20, dirichlet_eps=0.0), rng=rng)
     root = s.search(Position.start(), add_noise=False)

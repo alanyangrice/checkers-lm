@@ -1,18 +1,29 @@
 """PUCT Monte-Carlo tree search over :mod:`dq.rules` (AlphaZero-style).
 
-The search is independent of the network.  An ``Evaluator`` maps a
-position to ``(priors, value)`` where ``priors`` is a dict Move -> prob over
-the legal moves and ``value`` is in [-1, 1] from the point of view of the
-side to move.  Batched evaluation is the evaluator's business; the tree
-asks for one position at a time (virtual loss / batching can be added
-later without changing the interface).
+Two entry points share one tree implementation:
+
+* :meth:`MCTS.search` — one position, one leaf per simulation.  Simple,
+  used by tests and by evaluation matches.
+* :meth:`MCTS.search_batch` — many independent trees advanced in lockstep.
+  Each round collects up to ``leaves_per_tree`` leaves from every tree
+  using virtual loss, evaluates them all in **one** evaluator call, then
+  backs up.  With 32 trees × 8 leaves that is a 256-position forward pass
+  per round with no inter-process traffic, which is how self-play keeps a
+  GPU busy from a handful of Python processes.
+
+Evaluator interface (batched; a single-position call is the batch of one)::
+
+    evaluator(positions: list[Position], moves: list[list[Move]])
+        -> list[tuple[dict[Move, float], float]]
+
+``value`` is in [-1, 1] from the point of view of the side to move.
 
 Terminal handling: a position with no legal move is a loss (-1) for the
 side to move.  If a :class:`dq.tablebase.Tablebase` is supplied, covered
-positions are scored exactly (+1 / 0 / -1) and not expanded.
+interior positions are scored exactly and not expanded; the root is always
+expanded because a move must be chosen there.
 
-``search`` returns the root's visit distribution, which is the policy
-target for self-play; ``select_move`` samples from it with a temperature.
+Trees can be reused between moves with :meth:`MCTS.advance`.
 """
 from __future__ import annotations
 
@@ -23,12 +34,11 @@ from typing import Callable, Optional
 
 from dq.rules import Move, Position, apply_move, legal_moves
 
-Evaluator = Callable[[Position, list[Move]], tuple[dict[Move, float], float]]
+BatchEvaluator = Callable[[list[Position], list[list[Move]]], list[tuple[dict[Move, float], float]]]
 
 
-def uniform_evaluator(pos: Position, moves: list[Move]) -> tuple[dict[Move, float], float]:
-    p = 1.0 / len(moves)
-    return {m: p for m in moves}, 0.0
+def uniform_evaluator(positions: list[Position], moves: list[list[Move]]) -> list[tuple[dict[Move, float], float]]:
+    return [({m: 1.0 / len(ms) for m in ms}, 0.0) for ms in moves]
 
 
 @dataclass
@@ -38,12 +48,14 @@ class Node:
     prior: dict[Move, float] = field(default_factory=dict)
     children: dict[Move, "Node"] = field(default_factory=dict)
     N: int = 0
-    W: float = 0.0          # sum of values from the perspective of the side to move at this node
-    terminal_value: Optional[float] = None   # set for terminal / tablebase nodes
+    W: float = 0.0            # sum of values, perspective of the side to move here
+    vloss: int = 0            # virtual-loss count while a batch is in flight
+    terminal_value: Optional[float] = None
 
     @property
     def Q(self) -> float:
-        return self.W / self.N if self.N else 0.0
+        n = self.N + self.vloss
+        return (self.W - self.vloss) / n if n else 0.0   # virtual loss counts as -1
 
     @property
     def expanded(self) -> bool:
@@ -57,21 +69,21 @@ class SearchConfig:
     dirichlet_alpha: float = 0.3
     dirichlet_eps: float = 0.25        # 0 disables root noise
     fpu: float = 0.0                   # first-play-urgency value for unvisited children
+    leaves_per_tree: int = 8           # search_batch only
 
 
 class MCTS:
-    def __init__(self, evaluator: Evaluator, config: SearchConfig | None = None,
+    def __init__(self, evaluator: BatchEvaluator, config: SearchConfig | None = None,
                  tablebase=None, rng: random.Random | None = None) -> None:
         self.eval = evaluator
         self.cfg = config or SearchConfig()
         self.tb = tablebase
         self.rng = rng or random.Random()
 
-    # -- leaf evaluation --------------------------------------------------
-    def _evaluate(self, node: Node, use_tb: bool = True) -> float:
-        """Expand ``node`` (if needed) and return its value for the side to move.
-        ``use_tb=False`` forces expansion even if the tablebase covers the
-        position (needed at the root, where a move must be chosen)."""
+    # -- node preparation ---------------------------------------------------
+    def _prepare(self, node: Node, use_tb: bool = True) -> Optional[float]:
+        """Fill ``moves`` and decide whether the node is terminal / tablebase.
+        Returns the exact value if so, else None (needs the evaluator)."""
         if node.terminal_value is not None:
             return node.terminal_value
         if not node.moves:
@@ -84,61 +96,118 @@ class MCTS:
             if r is not None:
                 node.terminal_value = float(r[0])
                 return node.terminal_value
-        prior, value = self.eval(node.pos, node.moves)
-        node.prior = prior
-        return value
+        return None
+
+    def _expand_root(self, root: Node, add_noise: bool) -> None:
+        if root.expanded and root.terminal_value is None:
+            if add_noise:
+                self._add_root_noise(root)
+            return
+        root.terminal_value = None
+        if self._prepare(root, use_tb=False) is None:
+            (prior, _), = self.eval([root.pos], [root.moves])
+            root.prior = prior
+        if add_noise:
+            self._add_root_noise(root)
 
     def _add_root_noise(self, root: Node) -> None:
         eps, alpha = self.cfg.dirichlet_eps, self.cfg.dirichlet_alpha
-        if eps <= 0 or len(root.moves) <= 1:
+        if eps <= 0 or len(root.moves) <= 1 or not root.prior:
             return
         noise = [self.rng.gammavariate(alpha, 1.0) for _ in root.moves]
         s = sum(noise)
         for m, n in zip(root.moves, noise):
             root.prior[m] = (1 - eps) * root.prior[m] + eps * n / s
 
-    # -- selection ----------------------------------------------------------
+    # -- selection ------------------------------------------------------------
     def _select(self, node: Node) -> Move:
-        sqrt_n = math.sqrt(node.N + 1)
+        sqrt_n = math.sqrt(node.N + node.vloss + 1)
+        c = self.cfg.c_puct
         best, best_score = None, -1e9
         for m in node.moves:
             child = node.children.get(m)
-            # child's Q is from the child's mover's perspective -> negate
-            q = -child.Q if (child is not None and child.N) else self.cfg.fpu
-            u = self.cfg.c_puct * node.prior[m] * sqrt_n / (1 + (child.N if child else 0))
+            if child is not None and (child.N or child.vloss):
+                q = -child.Q
+                u = c * node.prior[m] * sqrt_n / (1 + child.N + child.vloss)
+            else:
+                q = self.cfg.fpu
+                u = c * node.prior[m] * sqrt_n
             score = q + u
             if score > best_score:
                 best, best_score = m, score
         return best  # type: ignore[return-value]
 
-    # -- search ---------------------------------------------------------------
+    def _descend(self, root: Node) -> list[Node]:
+        """Walk from root to a leaf (unexpanded or terminal), applying virtual
+        loss along the way.  Returns the path."""
+        node = root
+        path = [root]
+        while node.expanded and node.terminal_value is None:
+            m = self._select(node)
+            child = node.children.get(m)
+            if child is None:
+                child = Node(apply_move(node.pos, m))
+                node.children[m] = child
+            node = child
+            path.append(node)
+        for n in path:
+            n.vloss += 1
+        return path
+
+    @staticmethod
+    def _backup(path: list[Node], value: float) -> None:
+        """``value`` is from the leaf mover's perspective."""
+        for n in reversed(path):
+            n.vloss -= 1
+            n.N += 1
+            n.W += value
+            value = -value
+
+    # -- single-tree search -------------------------------------------------
     def search(self, pos: Position, root: Node | None = None, add_noise: bool = True) -> Node:
         root = root or Node(pos)
-        if not root.expanded or root.terminal_value is not None:
-            root.terminal_value = None
-            self._evaluate(root, use_tb=False)
-        if add_noise:
-            self._add_root_noise(root)
-        for _ in range(self.cfg.simulations):
-            node = root
-            path = [root]
-            # descend
-            while node.expanded and node.terminal_value is None:
-                m = self._select(node)
-                child = node.children.get(m)
-                if child is None:
-                    child = Node(apply_move(node.pos, m))
-                    node.children[m] = child
-                node = child
-                path.append(node)
-            value = self._evaluate(node)   # from node's mover's perspective
-            # backup: alternate sign up the path
-            for n in reversed(path):
-                n.N += 1
-                n.W += value
-                value = -value
+        self.search_batch([root], add_noise=add_noise, leaves_per_tree=1)
         return root
 
+    # -- lockstep batched search ---------------------------------------------
+    def search_batch(self, roots: list[Node], add_noise: bool = True,
+                     leaves_per_tree: int | None = None) -> None:
+        lpt = leaves_per_tree or self.cfg.leaves_per_tree
+        for r in roots:
+            self._expand_root(r, add_noise)
+        remaining = [self.cfg.simulations] * len(roots)
+        while any(remaining):
+            pending_paths: list[list[Node]] = []
+            pending_idx: list[int] = []
+            for i, root in enumerate(roots):
+                k = min(lpt, remaining[i])
+                for _ in range(k):
+                    path = self._descend(root)
+                    leaf = path[-1]
+                    v = self._prepare(leaf)
+                    if v is not None:
+                        self._backup(path, v)
+                        remaining[i] -= 1
+                    else:
+                        pending_paths.append(path)
+                        pending_idx.append(i)
+            if not pending_paths:
+                continue
+            # evaluate each distinct leaf once (two paths may reach the same leaf)
+            uniq: dict[int, Node] = {}
+            for path in pending_paths:
+                uniq.setdefault(id(path[-1]), path[-1])
+            leaves = list(uniq.values())
+            results = self.eval([n.pos for n in leaves], [n.moves for n in leaves])
+            val_by_id = {}
+            for n, (prior, value) in zip(leaves, results):
+                n.prior = prior
+                val_by_id[id(n)] = value
+            for path, i in zip(pending_paths, pending_idx):
+                self._backup(path, val_by_id[id(path[-1])])
+                remaining[i] -= 1
+
+    # -- results ------------------------------------------------------------
     def visit_counts(self, root: Node) -> dict[Move, int]:
         return {m: (root.children[m].N if m in root.children else 0) for m in root.moves}
 
@@ -156,6 +225,15 @@ class MCTS:
         counts = self.visit_counts(root)
         tot = sum(counts.values()) or 1
         return {m: c / tot for m, c in counts.items()}
+
+    @staticmethod
+    def advance(root: Node, mv: Move) -> Node:
+        """Reuse the subtree under ``mv`` as the next root."""
+        child = root.children.get(mv)
+        if child is None:
+            return Node(apply_move(root.pos, mv))
+        child.vloss = 0
+        return child
 
 
 def mcts_policy(mcts: MCTS, temperature: float = 0.0):

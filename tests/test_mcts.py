@@ -69,3 +69,33 @@ def test_mcts_beats_random_in_full_games() -> None:
             g = play_game(random_policy(rng), pol, max_plies=300)
             score += 1.0 - g.result
     assert score / n > 0.6, score
+
+
+def test_batched_search_matches_single_on_tablebase_wins(tb3: Tablebase) -> None:
+    """search_batch over many trees with virtual loss must still keep wins."""
+    rng = random.Random(21)
+    m = MCTS(uniform_evaluator, SearchConfig(simulations=60, dirichlet_eps=0.0, leaves_per_tree=8),
+             tablebase=tb3, rng=rng)
+    from dq.mcts import Node
+    roots = []
+    while len(roots) < 24:
+        p = random_position(rng, rng.randint(1, 2), rng.randint(1, 2), king_prob=0.5)
+        if tb3.covers(p) and len(legal_moves(p)) >= 2 and tb3.probe(p)[0] == WIN:
+            roots.append(Node(p))
+    m.search_batch(roots, add_noise=False)
+    for r in roots:
+        assert r.N == 60 and r.vloss == 0
+        mv = m.select_move(r, 0.0)
+        child = apply_move(r.pos, mv)
+        cv = (LOSS, 0) if child.pieces(child.turn) == 0 else tb3.probe(child)
+        assert cv[0] == LOSS, (r.pos.fen(), str(mv), cv)
+
+
+def test_tree_reuse_advance() -> None:
+    m = MCTS(uniform_evaluator, SearchConfig(simulations=30, dirichlet_eps=0.0), rng=random.Random(2))
+    root = m.search(Position.start(), add_noise=False)
+    mv = m.select_move(root, 0.0)
+    child = MCTS.advance(root, mv)
+    assert child.pos == apply_move(root.pos, mv) and child.N > 0
+    m.search(child.pos, root=child, add_noise=False)
+    assert child.N >= 30
