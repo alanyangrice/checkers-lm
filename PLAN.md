@@ -135,6 +135,37 @@ Run the concept-filter as an **A/B** (with vs without) from iteration 2 onward �
 - Headline: does a verifiable concept filter fix conceptual-coherence collapse in search distillation?
 - Secondary: QUEEN recipe transfers to a domain with no pre-existing expert encoder.
 
+## 5b. Self-play architecture and 5090 runbook
+
+Design (see `dq/selfplay.py` docstring): W worker processes each run G concurrent games and
+batch MCTS leaves across them with virtual loss, calling the network **in-process** — no
+per-leaf IPC, batch size = G × leaves_per_tree instead of "number of workers" (the layout
+in alanyangrice/checkers-rl). Trainer drains finished games, trains from a FIFO buffer,
+gates against the last promoted checkpoint, and publishes weights by file.
+
+Measured on the Mac (M5, MPS): ~3.3k sims/s/worker, GPU-bound. On the 5090 the forward pass
+is ~1 ms so the Python tree code (~100 µs/sim) is the limit → est. ~10k sims/s/worker;
+8 workers ≈ 80k sims/s ≈ 400 moves/s at 200 sims ≈ 5 games/s. If more is needed, the next
+lever is a compiled move generator + tree (numba/C), not more GPU.
+
+Runbook on the 5090 box:
+```
+git clone <repo> && cd checkers-lm
+uv venv --python 3.12 && uv pip install -e ".[dev]"      # torch CUDA wheel per pytorch.org
+.venv/bin/python -m pytest -q                              # ~2 min
+# tablebases: copy data/tb from the Mac (11 MB) or rebuild: Tablebase().build(4) ~3 min
+nohup .venv/bin/python scripts/selfplay.py runs/gen1 --rounds 2000 --workers 8 \
+    --games-per-worker 32 --sims 200 --round-seconds 120 --train-steps 500 \
+    --gate-every 5 --eval-games 40 --eval-sims 100 --tb data/tb > runs/gen1.log 2>&1 &
+tail -f runs/gen1/log.jsonl          # loss, games/round, gate results, promotions
+```
+Watch: policy loss falling, draw rate rising from ~0, `tb_wdl_err` falling toward 0,
+`vs_prev` ≥ 0.55 on most gates, `raw_vs_prev` climbing (the freeze criterion).
+
+Tablebase note: the pure-Python builder handles 4 pieces (3 min, 11 MB) but a 5-piece
+build swapped a 24 GB Mac; it needs either a leaner (numpy-only) bookkeeping pass or a
+compiled builder before 5–6 pieces. Not a blocker for training.
+
 ## 6. Compute budget (RTX 5090, 32 GB)
 
 | Item | Estimate |
