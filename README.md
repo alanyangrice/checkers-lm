@@ -16,9 +16,13 @@ uv venv --python 3.12 && uv pip install -e ".[dev]"
 |---|---|
 | `src/dq/rules.py` | Native Brazilian rules: `Position`, `Move`, `legal_moves`, `capture_sequences`, `max_capture_filter`, `apply_move`, `zobrist`, FEN I/O, POV rotation. ~14 µs per position. |
 | `src/dq/ref_pydraughts.py` | pydraughts wrapped to the same types. Reference oracle only (~1.8 ms per position). |
+| `src/dq/tokens.py` | Board tokens (5-symbol, POV) for the encoder; `<SQ_n>` / `<PIECE_xx>` text tokens, move<->text, POV move conversion. |
+| `src/dq/pdn.py` | lidraughts PDN reader + replayer (resolves ambiguous short-form captures by continuation). |
+| `src/dq/tablebase.py` | Retrograde WDL/DTM tablebases, POV-normalised, units by (pieces, men). Pure Python; <=3 pieces in seconds, 4 in minutes. |
 | `src/dq/verify.py` | Verification harness: QA question kinds with gold answers, parsers and checkers; explanation-structure checks. |
 | `tests/` | Unit tests, pydraughts cross-check, harness tests. |
-| `scripts/` | `crosscheck.py` (random cross-check), `crosscheck_edges.py` (targeted edge cases: max-capture ties, flying-king landings, back-rank pass-through, obstacle rings, dense king, mixed man/king), `bench.py`. |
+| `scripts/` | `crosscheck.py` (random cross-check), `crosscheck_edges.py` (targeted edge cases: max-capture ties, flying-king landings, back-rank pass-through, obstacle rings, dense king, mixed man/king), `bench.py`, `replay_pdn.py` (replay a lidraughts export). |
+| `data/lidraughts_brazilian.pdn` | 1,030 rated Brazilian games from top lidraughts players (Oct 2026); all replay through `rules.py`. |
 
 ## Conventions
 
