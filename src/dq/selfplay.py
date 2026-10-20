@@ -38,8 +38,8 @@ from pathlib import Path
 import torch
 import torch.multiprocessing as mp
 
-from dq.game import GameState, play_game
-from dq.mcts import MCTS, Node, SearchConfig, mcts_policy
+from dq.game import GameState
+from dq.mcts import MCTS, Node, SearchConfig
 from dq.model import (
     WDL_D, WDL_L, WDL_W, Example, ModelConfig, NetEvaluator, SquareTransformer, collate, loss_fn,
     make_example,
@@ -189,13 +189,46 @@ def train_steps(model, opt, buffer: list[Example], cfg: SelfPlayConfig, device, 
     return {k: v / n for k, v in agg.items()}
 
 
-def match(pol_a, pol_b, games: int, max_plies: int = 300) -> float:
+def match(ev_a: NetEvaluator, ev_b: NetEvaluator, games: int, sims: int, tb, rng: random.Random,
+          max_plies: int = 300, raw_a: bool = False) -> float:
+    """Score of A over ``games`` games (alternating colours), all played
+    concurrently: each side's searches are batched across the games it is
+    to move in.  ``raw_a`` makes A play its raw policy (no search)."""
+    sc = SearchConfig(simulations=sims, dirichlet_eps=0.0, leaves_per_tree=8)
+    ma, mb = MCTS(ev_a, sc, tablebase=tb, rng=rng), MCTS(ev_b, sc, tablebase=tb, rng=rng)
+    states = [GameState(Position.start()) for _ in range(games)]
+    a_is_white = [i % 2 == 0 for i in range(games)]
+    roots: list[Node | None] = [None] * games
+    while True:
+        live = [i for i, g in enumerate(states) if not g.over and len(g.history) < max_plies]
+        if not live:
+            break
+        for side_a in (True, False):
+            idx = [i for i in live if (states[i].pos.turn == WHITE) == (a_is_white[i] == side_a)]
+            if not idx:
+                continue
+            m = ma if side_a else mb
+            if side_a and raw_a:
+                for i in idx:
+                    g = states[i]
+                    moves = g.legal()
+                    (prior, _), = ev_a([g.pos], [moves])
+                    g.push(max(moves, key=lambda mv: prior[mv]))
+                continue
+            rs = []
+            for i in idx:
+                if roots[i] is None or roots[i].pos != states[i].pos:
+                    roots[i] = Node(states[i].pos)
+                rs.append(roots[i])
+            m.search_batch(rs, add_noise=False)
+            for i, r in zip(idx, rs):
+                mv = m.select_move(r, 0.0)
+                states[i].push(mv)
+                roots[i] = MCTS.advance(r, mv)
     score = 0.0
-    for i in range(games):
-        if i % 2 == 0:
-            score += play_game(pol_a, pol_b, max_plies=max_plies).result
-        else:
-            score += 1.0 - play_game(pol_b, pol_a, max_plies=max_plies).result
+    for g, aw in zip(states, a_is_white):
+        res = g.result if g.result is not None else 0.5
+        score += res if aw else 1.0 - res
     return score / games
 
 
@@ -222,11 +255,8 @@ def tablebase_wdl_error(model, tb: Tablebase, n: int, rng: random.Random, device
 
 def gate(model, prev, cfg: SelfPlayConfig, tb, device, rng) -> dict[str, float]:
     ev, ev_prev = NetEvaluator(model, device), NetEvaluator(prev, device)
-    sc = SearchConfig(simulations=cfg.eval_sims, dirichlet_eps=0.0, leaves_per_tree=1)
-    cur = mcts_policy(MCTS(ev, sc, tablebase=tb, rng=rng))
-    old = mcts_policy(MCTS(ev_prev, sc, tablebase=tb, rng=rng))
-    out = {"vs_prev": match(cur, old, cfg.eval_games, cfg.max_plies),
-           "raw_vs_prev": match(raw_policy(ev), old, cfg.eval_games, cfg.max_plies)}
+    out = {"vs_prev": match(ev, ev_prev, cfg.eval_games, cfg.eval_sims, tb, rng, cfg.max_plies),
+           "raw_vs_prev": match(ev, ev_prev, cfg.eval_games, cfg.eval_sims, tb, rng, cfg.max_plies, raw_a=True)}
     if tb is not None:
         out["tb_wdl_err"] = tablebase_wdl_error(model, tb, cfg.tb_samples, rng, device)
     return out
