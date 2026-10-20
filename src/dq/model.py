@@ -113,17 +113,23 @@ def make_example(pos: Position, visit_policy: dict[Move, float], result_for_move
 
 
 def collate(batch: list[Example], device=None) -> dict[str, torch.Tensor]:
+    """Dense tensors for a batch.  The policy target is scattered from the
+    sparse per-example dicts in one call."""
     B = len(batch)
     ids = torch.tensor([e.ids for e in batch], dtype=torch.long)
-    pol = torch.zeros(B, N_PAIRS)
+    rows, cols, vals = [], [], []
     for i, e in enumerate(batch):
-        for k, p in e.policy.items():
-            pol[i, k] = p
+        rows.extend([i] * len(e.policy))
+        cols.extend(e.policy.keys())
+        vals.extend(e.policy.values())
+    pol = torch.zeros(B, N_PAIRS)
+    if rows:
+        pol.index_put_((torch.tensor(rows), torch.tensor(cols)), torch.tensor(vals, dtype=torch.float32), accumulate=True)
     wdl = torch.tensor([e.wdl for e in batch], dtype=torch.long)
     ncap = torch.tensor([e.ncap for e in batch], dtype=torch.long)
     out = {"ids": ids, "policy": pol, "wdl": wdl, "ncap": ncap}
     if device is not None:
-        out = {k: v.to(device) for k, v in out.items()}
+        out = {k: v.to(device, non_blocking=True) for k, v in out.items()}
     return out
 
 
