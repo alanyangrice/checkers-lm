@@ -1,0 +1,172 @@
+# Draughts-QUEEN: An LM That Plays Brazilian Draughts and Explains Its Moves
+
+**Status:** Phase 0 in progress · **Owner:** Alan · **Started:** Oct 2026
+
+Adapt the QUEEN recipe (Bhaskar, Cheng, Chen — Princeton, arXiv 2610.03695) from chess to Brazilian draughts: a frozen expert encoder, a frozen instruction-tuned LM, a trained cross-attention bridge, a verifiable QA curriculum, and iterative search distillation. Target: a ~4B model that plays at a credible lidraughts rating and produces explanations whose moves, lines, and concepts can be checked.
+
+Legend used throughout:
+- **[lit]** — established in published work (mostly QUEEN)
+- **[ext]** — reasonable extension of published work, not yet demonstrated
+- **[spec]** — speculative, no published analog
+
+---
+
+## 1. Why this project
+
+- QUEEN showed an LM cross-attending into a silent expert's latents can reach ~2700 Lichess Elo and explain moves, but its weakest result was *conceptual coherence* (2.76/5): hallucinated motifs propagate through the distillation loop because nothing checks them. [lit]
+- Draughts has a small, programmatically definable concept vocabulary (shot, exchange, trapped king, tempo, bridge). That makes a **verifiable concept filter** in the distillation loop possible — the thing QUEEN couldn't do. [ext]
+- 32 playable squares and 4 piece types make the whole stack cheap enough for one RTX 5090.
+
+## 2. Key decisions
+
+| Decision | Choice | Why |
+|---|---|---|
+| Variant | **Brazilian draughts** (8×8, international rules) | Only 8×8 variant with a rated online pool + bot API (lidraughts.org). Rules are a strict subset of 10×10 international, so a later scale-up is mostly a board-size change. |
+| Oracle | **Self-oracle**: own encoder + deep MCTS, plus self-generated endgame tablebases (≤6–7 pieces) | No strong public Brazilian engine confirmed. AlphaZero-style self-oracle is defensible; tablebases make the endgame exact. |
+| Move generation | `pydraughts` | Used by lidraughts-bot; handles max-capture rule and flying kings. |
+| Expert encoder | Train from scratch, AlphaZero-style | No Lc0 equivalent exists for draughts. [ext] |
+| Decoder | SmolLM3-3B (fallback Qwen3-4B) | QUEEN's best backbone in ablation; general-purpose, no draughts training. |
+| Bridge | Flamingo-style gated cross-attention, encoder layer *i* → decoder layer *2i* | QUEEN's winning architecture; beat LLaVA-prefix and KV-projection. [lit] |
+| Seed explanations | Templated hand-crafted-eval (HCE) route, no frontier model | QUEEN showed HCE seeding matches frontier seeding on Elo trajectory. [lit] Saves cost and avoids licensing issues. |
+| External metric | lidraughts BOT rating (Brazilian) | Real human-pool rating. |
+
+**Trade-off accepted:** English checkers has a near-perfect oracle (KingsRow/Cake + endgame DBs) but no rated pool; Brazilian has the rated pool but a weaker grader. We chose the public scoreboard.
+
+## 3. Rules that matter for the implementation
+
+Brazilian draughts = international rules on 8×8:
+- Men move forward diagonally, **capture forward and backward**.
+- **Flying kings**: slide any distance, land on any empty square beyond the captured piece.
+- **Mandatory capture, maximum-capture rule**: must take the sequence capturing the most pieces.
+- No promotion mid-jump (a man passing through the back rank during a capture does not become a king until the sequence ends there).
+- Captured pieces are removed after the full sequence (can't jump the same piece twice).
+- White moves first.
+
+The max-capture rule is the hardest thing for both the move generator and the LM to read out of latents. See risks.
+
+## 4. Architecture
+
+```
+FEN-like position string
+        │
+        ▼
+┌──────────────────────┐      gated cross-attn        ┌──────────────────────────┐
+│  Expert encoder      │  e_i ──────────────────────▶ │  Decoder LM (frozen)     │
+│  (frozen, ~25M)      │  (layer i → decoder 2i)      │  SmolLM3-3B              │
+│  32 tokens = squares │                              │  + 32 square tokens      │
+│  8 layers × 512      │                              │  + 4 POV piece tokens    │
+│  heads: policy, WDL  │                              └──────────────────────────┘
+└──────────────────────┘                                          │
+                                                                  ▼
+                                   prose → BEST_MOVE → CRITICAL_LINE → PROMISING_MOVES → EVALUATION (WDL %)
+```
+
+- **Tokens:** 32 square tokens (playable squares only) + POV-relative piece tokens `<PIECE_MM>`, `<PIECE_MK>`, `<PIECE_OM>`, `<PIECE_OK>` (mine/opponent × man/king). Board is reflected so the side to move is always "me". [lit]
+- **Bridge:** gated cross-attention blocks, `tanh(α)` gate with α=0 at init so cross-attn opens gradually. ~16 blocks. [lit]
+- **Encoder:** transformer over 32 square tokens; policy head over (from, to) pairs plus a capture-sequence head; WDL value head. [ext]
+- **Evaluation unit:** win/draw/loss probability, not centipawns — draughts engines report WDL and the game is drawish.
+
+## 5. Phases
+
+### Phase 0 — Infrastructure (week 1)
+- [x] `pydraughts` Brazilian move gen wrapped with: legal moves, all capture sequences, max-capture filter, apply-move, position hashing. (Native generator in `dq/rules.py`, ~130× faster than pydraughts; pydraughts kept as reference oracle, cross-checked on 20K+ positions.)
+- [ ] Position encoding ↔ tokens, with POV reflection.
+- [ ] Retrograde tablebase generator for ≤6 pieces (extend to 7 if disk allows). WDL + distance-to-win.
+- [x] Verification harness: every answer in the QA curriculum must be checkable programmatically. (`dq/verify.py`)
+- [ ] Download lidraughts Brazilian game database for seed positions.
+
+### Phase 1 — Expert encoder (weeks 1–3) [ext]
+- [ ] AlphaZero-style self-play loop: MCTS + transformer encoder, policy/WDL heads.
+- [ ] **Auxiliary head: capture-sequence count / max-capture length** during self-play, to keep that information in the residual stream (mitigates Risk 1).
+- [ ] Gates:
+  - beats own MCTS at 1 node by >80% with search off
+  - zero WDL errors on tablebase positions
+  - lidraughts bot rating for the raw engine (baseline number, also validates the bot plumbing early)
+- [ ] Freeze. Record which layers are most probe-able (linear probes for legal-move sets, material, king count) — informs which encoder layers to bridge.
+
+### Phase 2 — Domain adaptation / QA curriculum (weeks 3–5) [lit]
+Four stages, sequential, earlier stages replayed at 6–10%. Encoder + decoder frozen; train bridge + new embeddings only. AdamW, cosine, early stopping on held-out accuracy.
+
+| Stage | Question types | Target acc |
+|---|---|---|
+| STATIC-CURRENT | piece on square; locate kings; material / king counts; tempo count | >99.5% |
+| DYNAMIC-CURRENT | legal moves for a piece; **all capture sequences and which are maximal**; threatened pieces; safe king moves | >98% |
+| STATIC-FUTURE | board after a 1–6 move sequence | >99.5% |
+| DYNAMIC-FUTURE | legal moves / captures / threats after a sequence | >95% |
+
+Checkpoint name: **PAWN-equivalent** (call it `MAN-0`).
+
+Ablations to run once (cheap, at this stage): no encoder (dictionary board state as text); no curriculum. QUEEN saw both collapse Elo to ~500. [lit]
+
+### Phase 3 — Seed explanations (week 5) [lit, HCE variant]
+No frontier-model seeding.
+- Alpha-beta to 3 ply with own encoder as evaluator; extend captures; cap tree ~40 nodes.
+- "Plausible mistakes" from a low-node version of own net (replaces Maia).
+- Judge retained lines with deeper MCTS (replaces Stockfish-1000); mark refuted / superseded lines.
+- Verbalize up to 3 salient feature deltas per move via templates. Feature set (all computable):
+  - material, king count, tempo (sum of advancement), back-rank integrity, center control, mobility, trapped king, hanging piece, **shot** (forced capture sequence netting material), exchange.
+- ~15K positions → SFT → `MAN-1`.
+
+### Phase 4 — Iterative search distillation (weeks 6–10) [lit]
+Per iteration *k* → *k+1*:
+1. **Sample** ~100–250K roots: self-play vs own net at log-random node counts (downsample lopsided WDL), lidraughts human games, generated endgames within tablebase range.
+2. **Generate** 3 promising moves from `MAN-k`; if all are mistakes, swap worst for oracle move.
+3. **Recurse** into any child whose top move is a mistake (≥10% WDL drop, or any tablebase error). Max 5 descents.
+4. **Consolidate** 3 child explanations with a mid-size instruction model (Qwen3-27B class), instructed to add nothing.
+5. **Filter** by first-divergence PV comparison; **[ext] also filter on verified concepts** — drop or flag explanations whose named motifs fail the programmatic check.
+6. **SFT** → `MAN-(k+1)`.
+
+Run 5–7 iterations. Track internal-ladder rating per iteration; expect a QUEEN-shaped curve.
+
+Run the concept-filter as an **A/B** (with vs without) from iteration 2 onward — this is the main scientific claim.
+
+### Phase 5 — Evaluation (ongoing from Phase 3)
+
+| Axis | Metric | Tool |
+|---|---|---|
+| Accuracy | lidraughts BOT rating (Brazilian); internal ladder vs own net at fixed nodes | lidraughts-bot |
+| Substantiation | no-mistake rate (NMR) and first-move NMR on 1K tactical + 1K general positions; **exact** on tablebase positions | oracle + tablebases |
+| Coherence — structural | LM judge, 1–5 | as QUEEN |
+| Coherence — conceptual | **programmatic concept check** (precision of named motifs) + LM judge | [ext] |
+| Fluency | LM judge | as QUEEN |
+| Not-a-policy-readout | disagreement with encoder's policy on positions with ≥4 near-equal moves | as QUEEN |
+
+### Phase 6 — Write-up
+- Headline: does a verifiable concept filter fix conceptual-coherence collapse in search distillation?
+- Secondary: QUEEN recipe transfers to a domain with no pre-existing expert encoder.
+
+## 6. Compute budget (RTX 5090, 32 GB)
+
+| Item | Estimate |
+|---|---|
+| Encoder self-play | 3–7 days wall-clock |
+| Tablebases ≤6 pieces | hours; disk ~tens of GB |
+| QA curriculum (bridge ~470M trainable, bf16, grad ckpt, seq 1–2K) | 2–4 days total across 4 stages |
+| Seed SFT | hours |
+| Each distillation iteration | data gen 1–2 days (parallel inference), SFT ~1 day |
+| Consolidation model (27B) | run quantized, or rent a cloud GPU for the gen step only |
+
+If the full bridge doesn't fit: bridge every 4th decoder layer, or LoRA the decoder with a lighter prefix bridge (QUEEN's LLaVA variant worked but trailed).
+
+## 7. Risks
+
+1. **Max-capture structure isn't readable from latents.** The encoder may play well without representing every capture sequence. Mitigation: auxiliary capture head in Phase 1; probe before bridging; if DYNAMIC-CURRENT stalls <95%, add the head and retrain.
+2. **Self-oracle is wrong in the opening/midgame.** Mistake filter is only as good as deep MCTS. Mitigation: use tablebases wherever possible; sanity-check oracle against lidraughts top-player games; keep the 10% WDL threshold loose.
+3. **Drawishness.** Many positions have several equally-good moves; "mistake" detection has low signal. Mitigation: oversample tactical/shot positions and endgames in the root pool.
+4. **lidraughts bot pool is thin.** Rating may be noisy / few opponents. Mitigation: also report the internal ladder; play many games over weeks.
+5. **Hallucinated concepts survive consolidation** (QUEEN's failure). This is the thing we're testing; the concept filter is the mitigation and the experiment.
+6. **Thin human commentary corpus.** No Lichess-scale annotated games. HCE templating sidesteps this, but prose will sound templated early; distillation iterations are what diversify it.
+
+## 8. Speculative directions (not in scope) [spec]
+- Replace SFT consolidation with RL against the oracle directly.
+- Scale to 10×10 international (FMJD ratings, Scan as a real oracle).
+- Use the same bridge recipe on a JEPA latent world model instead of a game encoder (QA curriculum over inventory / held item / block-in-front).
+
+## 9. References
+- QUEEN — Language Models that Play Chess and Explain Their Moves: https://arxiv.org/abs/2610.03695
+- Flamingo (Alayrac et al., 2022): https://arxiv.org/abs/2204.14198
+- AlphaZero (Silver et al., 2017): https://arxiv.org/abs/1712.01815
+- Evidence of learned look-ahead in a chess-playing network (Jenner et al., 2024): https://arxiv.org/abs/2406.00877
+- Acquisition of chess knowledge in AlphaZero (McGrath et al., 2022): https://doi.org/10.1073/pnas.2206625119
+- lidraughts: https://github.com/roepstoep/lidraughts · lidraughts-bot: https://github.com/AttackingOrDefending/lidraughts-bot
+- pydraughts: https://github.com/AttackingOrDefending/pydraughts
