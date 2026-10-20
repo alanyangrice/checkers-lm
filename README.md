@@ -18,7 +18,7 @@ uv venv --python 3.12 && uv pip install -e ".[dev]"
 | `src/dq/ref_pydraughts.py` | pydraughts wrapped to the same types. Reference oracle only (~1.8 ms per position). |
 | `src/dq/verify.py` | Verification harness: QA question kinds with gold answers, parsers and checkers; explanation-structure checks. |
 | `tests/` | Unit tests, pydraughts cross-check, harness tests. |
-| `scripts/` | `crosscheck.py` (long cross-check), `bench.py`. |
+| `scripts/` | `crosscheck.py` (random cross-check), `crosscheck_edges.py` (targeted edge cases: max-capture ties, flying-king landings, back-rank pass-through, obstacle rings, dense king, mixed man/king), `bench.py`. |
 
 ## Conventions
 
