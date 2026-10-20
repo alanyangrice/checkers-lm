@@ -71,7 +71,7 @@ FEN-like position string
 ### Phase 0 — Infrastructure (week 1)
 - [x] `pydraughts` Brazilian move gen wrapped with: legal moves, all capture sequences, max-capture filter, apply-move, position hashing. (Native generator in `dq/rules.py`, ~130× faster than pydraughts; pydraughts kept as reference oracle, cross-checked on 20K+ positions.)
 - [x] Position encoding ↔ tokens, with POV reflection (`dq/tokens.py`).
-- [~] Retrograde tablebase generator (`dq/tablebase.py`): exact WDL + DTM, verified vs negamax on ≤3 pieces; 4 pieces builds in pure Python. ≤6 needs the inner loops compiled (numba/C) — Phase 1 prerequisite, not Phase 0.
+- [~] Retrograde tablebase generator (`dq/tablebase.py`): exact WDL + DTM, verified vs negamax on ≤3 pieces; 4 pieces (6.2M positions, 11 MB on disk, max DTM 86) builds in ~3 min on the Mac; 13k random 4-piece positions pass the one-step consistency check. 5 pieces is feasible in pure Python (~1 h est.); 6 needs the inner loops compiled (numba/C) and ~4 GB RAM — a Phase 1 prerequisite.
 - [x] Verification harness: every answer in the QA curriculum must be checkable programmatically. (`dq/verify.py`)
 - [x] 1,030 rated Brazilian games from top lidraughts players (`data/lidraughts_brazilian.pdn`); all replay through `rules.py`, recorded losers match no-move finals. Numbering/orientation validated on real data.
 
