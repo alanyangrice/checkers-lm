@@ -23,7 +23,7 @@ Legend used throughout:
 |---|---|---|
 | Variant | **Brazilian draughts** (8×8, international rules) | Only 8×8 variant with a rated online pool + bot API (lidraughts.org). Rules are a strict subset of 10×10 international, so a later scale-up is mostly a board-size change. |
 | Oracle | **Self-oracle**: own encoder + deep MCTS, plus self-generated endgame tablebases (≤6–7 pieces) | No strong public Brazilian engine confirmed. AlphaZero-style self-oracle is defensible; tablebases make the endgame exact. |
-| Move generation | `pydraughts` | Used by lidraughts-bot; handles max-capture rule and flying kings. |
+| Move generation | Native (`dq/rules.py`), pydraughts as oracle | pydraughts is ~130× slower (object-based); native generator is cross-checked against it. |
 | Expert encoder | Train from scratch, AlphaZero-style | No Lc0 equivalent exists for draughts. [ext] |
 | Decoder | SmolLM3-3B (fallback Qwen3-4B) | QUEEN's best backbone in ablation; general-purpose, no draughts training. |
 | Bridge | Flamingo-style gated cross-attention, encoder layer *i* → decoder layer *2i* | QUEEN's winning architecture; beat LLaVA-prefix and KV-projection. [lit] |
@@ -70,10 +70,10 @@ FEN-like position string
 
 ### Phase 0 — Infrastructure (week 1)
 - [x] `pydraughts` Brazilian move gen wrapped with: legal moves, all capture sequences, max-capture filter, apply-move, position hashing. (Native generator in `dq/rules.py`, ~130× faster than pydraughts; pydraughts kept as reference oracle, cross-checked on 20K+ positions.)
-- [ ] Position encoding ↔ tokens, with POV reflection.
-- [ ] Retrograde tablebase generator for ≤6 pieces (extend to 7 if disk allows). WDL + distance-to-win.
+- [x] Position encoding ↔ tokens, with POV reflection (`dq/tokens.py`).
+- [~] Retrograde tablebase generator (`dq/tablebase.py`): exact WDL + DTM, verified vs negamax on ≤3 pieces; 4 pieces builds in pure Python. ≤6 needs the inner loops compiled (numba/C) — Phase 1 prerequisite, not Phase 0.
 - [x] Verification harness: every answer in the QA curriculum must be checkable programmatically. (`dq/verify.py`)
-- [ ] Download lidraughts Brazilian game database for seed positions.
+- [x] 1,030 rated Brazilian games from top lidraughts players (`data/lidraughts_brazilian.pdn`); all replay through `rules.py`, recorded losers match no-move finals. Numbering/orientation validated on real data.
 
 ### Phase 1 — Expert encoder (weeks 1–3) [ext]
 - [ ] AlphaZero-style self-play loop: MCTS + transformer encoder, policy/WDL heads.
