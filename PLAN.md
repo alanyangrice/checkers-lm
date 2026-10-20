@@ -76,12 +76,12 @@ FEN-like position string
 - [x] 1,030 rated Brazilian games from top lidraughts players (`data/lidraughts_brazilian.pdn`); all replay through `rules.py`, recorded losers match no-move finals. Numbering/orientation validated on real data.
 
 ### Phase 1 — Expert encoder (weeks 1–3) [ext]
-- [~] AlphaZero-style self-play loop: `dq/game.py` (lidraughts draw rules 7.2.3–7.2.8), `dq/mcts.py` (PUCT, tablebase leaves), `dq/model.py` (32-token transformer, policy/WDL/ncap heads), `dq/selfplay.py` + `scripts/selfplay.py` (generate → train → gate → promote). Smoke-tested end to end on the Mac. Still single-process, unbatched: needs batched leaf eval + multiprocess generation before a real run on the 5090.
+- [~] AlphaZero-style self-play loop: `dq/game.py` (lidraughts draw rules 7.2.3–7.2.8), `dq/mcts.py` (PUCT, tablebase leaves), `dq/model.py` (32-token transformer, policy/WDL/ncap heads), `dq/selfplay.py` + `scripts/selfplay.py` (generate → train → gate → promote). Smoke-tested end to end on the Mac. Batched: each worker runs G concurrent games and evaluates leaves across them in one forward pass (virtual loss); W workers share the GPU; trainer gates + publishes weights by file. ~3.3k sims/s/worker on the Mac (MPS-bound); est. ~10k/worker on the 5090 (Python tree code-bound).
 - [x] **Auxiliary head: max-capture length** (`ncap`, weight 0.25) in the model and loss.
 - [ ] Gates:
   - beats own MCTS at 1 node by >80% with search off
   - zero WDL errors on tablebase positions
-  - lidraughts bot rating for the raw engine (baseline number, also validates the bot plumbing early)
+  - lidraughts bot rating for the raw engine (baseline number, also validates the bot plumbing early) — engine wrapper done (`bot/dq_engine.py`), needs a BOT account token to go live
 - [ ] Freeze. Record which layers are most probe-able (linear probes for legal-move sets, material, king count) — informs which encoder layers to bridge.
 
 ### Phase 2 — Domain adaptation / QA curriculum (weeks 3–5) [lit]

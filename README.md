@@ -24,7 +24,8 @@
 | `src/dq/model.py` | Encoder: 32-token transformer, policy over (from,to) pairs, WDL + max-capture heads; `NetEvaluator` (batched). |
 | `src/dq/selfplay.py` | Self-play: GPU workers with G concurrent games each, trainer with replay buffer, gating and weight publishing by file. |
 | `src/dq/verify.py` | Verification harness: QA question kinds with gold answers, parsers and checkers; explanation-structure checks. |
- `src/dq/verify.py` | `tests/` | Unit tests, pydraughts cross-check, harness tests. |
+ `src/dq/verify.py` | `bot/` | lidraughts-bot homemade engine (`dq_engine.py`) + config template; see the module docstring for setup. |
+| `tests/` | Unit tests, pydraughts cross-check, harness tests. |
  `src/dq/verify.py` | `scripts/` | `crosscheck.py` (random cross-check), `crosscheck_edges.py` (targeted edge cases: max-capture ties, flying-king landings, back-rank pass-through, obstacle rings, dense king, mixed man/king), `bench.py`, `replay_pdn.py` (replay a lidraughts export), `selfplay.py` (training CLI). |
  `src/dq/verify.py` | `data/lidraughts_brazilian.pdn` | 1,030 rated Brazilian games from top lidraughts players (Oct 2026); all replay through `rules.py`. |
  `src/dq/verify.py` 
