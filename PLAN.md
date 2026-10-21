@@ -162,6 +162,16 @@ tail -f runs/gen1/log.jsonl          # loss, games/round, gate results, promotio
 Watch: policy loss falling, draw rate rising from ~0, `tb_wdl_err` falling toward 0,
 `vs_prev` ≥ 0.55 on most gates, `raw_vs_prev` climbing (the freeze criterion).
 
+Evidence the loop learns (Mac, CPU, 87k-param `--small` model, 2 workers, 64 sims, 30 s rounds):
+round 0→9 policy loss 4.19→2.24, ncap loss 0.85→0.55, draw rate 0→18%, gates vs previous
+checkpoint 0.59 / 0.55, raw-policy-vs-previous-search 0.10→0.23, tablebase WDL error
+0.37→0.27. WDL loss flat at ~0.79 over this window (outcome noise early on) — the metric to
+watch first on the real run.
+
+Gating: by default the gate is a *metric* (AlphaZero-style continuous updates); `--gate-revert`
+restores AlphaGo-Zero-style reject-and-revert. Gate matches use random paired openings because
+search at T=0 is deterministic.
+
 Tablebase note: the pure-Python builder handles 4 pieces (3 min, 11 MB) but a 5-piece
 build swapped a 24 GB Mac; it needs either a leaner (numpy-only) bookkeeping pass or a
 compiled builder before 5–6 pieces. Not a blocker for training.
