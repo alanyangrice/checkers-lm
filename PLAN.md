@@ -179,7 +179,21 @@ WDL 0.74→0.47 (still falling), ncap →0.005, draw rate 8→42 %, tb_wdl_err 0
 round 34), gates vs_prev 0.43–0.59 (noise at 40 games), raw_vs_prev 0.09–0.30 (freeze criterion
 far off). Weights: runs/gen1_final.pt.
 
-gen2 resumes from gen1_final.pt with `--tb-rescore` (exact tablebase WDL as the value target for
+**Gate bug found 2026-10-21 (fixed in ae8ef46):** `match()` shared one search tree per game between the
+two players, blending both networks' priors and values — every head-to-head score was compressed
+toward 0.5. The trained net scored 0.575 vs a *random-init* net under the bug; 100–0 after the fix.
+All `vs_prev` / `raw_vs_prev` numbers logged before the fix are meaningless (training itself was
+unaffected: gates don't revert). `scripts/eval_ckpts.py` now gives honest checkpoint comparisons.
+
+Honest strength trajectory (fixed eval, 100 games, 100 sims, vs gen1 round 63): round 4 → 0.87,
+round 14 → 0.66, round 29 → 0.50, gen2 round 63 → 0.49. **Strength rose for ~30 rounds (1 h),
+then plateaued for ~4 h** while policy loss sat at 1.16 and WDL/tb_err kept improving. Rescoring
+and endgame starts (gen2) did not move strength. gen3 cuts LR 1e-3 → 2e-4 (standard AlphaZero /
+Lc0 / KataGo step-down after the initial phase), everything else fixed, with `--anchor
+runs/gen1_final.pt` so each gate logs `vs_anchor` as a trend line. If gen3 is also flat, next
+levers in order: more sims per move (better targets), larger replay ratio check, bigger model.
+
+gen2 resumed from gen1_final.pt with `--tb-rescore` (exact tablebase WDL as the value target for
 covered positions, Lc0-style) and `--endgame-start-frac 0.2` (20 % of games start from a random
 5–8-piece position, KataGo-style mixed starts) — aimed at the tb_wdl_err plateau. Hypothesis to
 check: tb_wdl_err drops below 0.10 and WDL keeps falling; gate win rate is not expected to move.
