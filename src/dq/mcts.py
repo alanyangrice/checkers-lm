@@ -21,7 +21,17 @@ Evaluator interface (batched; a single-position call is the batch of one)::
 Terminal handling: a position with no legal move is a loss (-1) for the
 side to move.  If a :class:`dq.tablebase.Tablebase` is supplied, covered
 interior positions are scored exactly and not expanded; the root is always
-expanded because a move must be chosen there.
+expanded because a move must be chosen there.  With ``tb_ply_limit`` (see
+:func:`dq.game.draw_ply_limit`) a tablebase win or loss whose DTM exceeds
+the ply limit of the draw rule active at that position is scored as a draw,
+since the game would be adjudicated before it could be converted.
+
+Repetition: ``search_batch(..., seen=...)`` takes, per tree, the game's
+position-occurrence counts (``GameState.seen``).  A node that would be the
+third occurrence of its position, counting the game history and the path
+from the root, is scored as a draw for that visit and not expanded —
+lidraughts rule 7.2.3.  Draw *counters* (7.2.4–7.2.8) are not tracked in
+the tree beyond the tablebase adjustment above.
 
 Trees can be reused between moves with :meth:`MCTS.advance`.
 """
@@ -30,9 +40,9 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
 
-from dq.rules import Move, Position, apply_move, legal_moves
+from dq.rules import Move, Position, apply_move, legal_moves, zobrist
 
 BatchEvaluator = Callable[[list[Position], list[list[Move]]], list[tuple[dict[Move, float], float]]]
 
@@ -51,6 +61,14 @@ class Node:
     W: float = 0.0            # sum of values, perspective of the side to move here
     vloss: int = 0            # virtual-loss count while a batch is in flight
     terminal_value: Optional[float] = None
+    _key: Optional[int] = None
+
+    @property
+    def key(self) -> int:
+        """Zobrist hash of ``pos`` (includes side to move), cached."""
+        if self._key is None:
+            self._key = zobrist(self.pos)
+        return self._key
 
     @property
     def Q(self) -> float:
@@ -77,10 +95,12 @@ class SearchConfig:
 
 class MCTS:
     def __init__(self, evaluator: BatchEvaluator, config: SearchConfig | None = None,
-                 tablebase=None, rng: random.Random | None = None) -> None:
+                 tablebase=None, rng: random.Random | None = None,
+                 tb_ply_limit: Callable[[Position], Optional[int]] | None = None) -> None:
         self.eval = evaluator
         self.cfg = config or SearchConfig()
         self.tb = tablebase
+        self.tb_ply_limit = tb_ply_limit
         self.rng = rng or random.Random()
 
     # -- node preparation ---------------------------------------------------
@@ -97,7 +117,12 @@ class MCTS:
         if use_tb and self.tb is not None and self.tb.covers(node.pos):
             r = self.tb.probe(node.pos)
             if r is not None:
-                node.terminal_value = float(r[0])
+                v, dtm = r
+                if v != 0 and self.tb_ply_limit is not None:
+                    limit = self.tb_ply_limit(node.pos)
+                    if limit is not None and dtm > limit:
+                        v = 0          # would be adjudicated a draw before conversion
+                node.terminal_value = float(v)
                 return node.terminal_value
         return None
 
@@ -140,11 +165,17 @@ class MCTS:
                 best, best_score = m, score
         return best  # type: ignore[return-value]
 
-    def _descend(self, root: Node) -> list[Node]:
+    def _descend(self, root: Node, seen: Mapping[int, int] | None = None) -> tuple[list[Node], bool]:
         """Walk from root to a leaf (unexpanded or terminal), applying virtual
-        loss along the way.  Returns the path."""
+        loss along the way.  Returns ``(path, repetition)``; ``repetition`` is
+        True when the leaf would be the third occurrence of its position
+        (game history ``seen`` plus the path), i.e. a draw by 7.2.3."""
         node = root
         path = [root]
+        rep = False
+        path_keys: dict[int, int] | None = None
+        if seen is not None:
+            path_keys = {root.key: 1}
         while node.expanded and node.terminal_value is None:
             m = self._select(node)
             child = node.children.get(m)
@@ -153,9 +184,15 @@ class MCTS:
                 node.children[m] = child
             node = child
             path.append(node)
+            if path_keys is not None:
+                k = node.key
+                if seen.get(k, 0) + path_keys.get(k, 0) >= 2:
+                    rep = True
+                    break
+                path_keys[k] = path_keys.get(k, 0) + 1
         for n in path:
             n.vloss += 1
-        return path
+        return path, rep
 
     @staticmethod
     def _backup(path: list[Node], value: float) -> None:
@@ -167,14 +204,19 @@ class MCTS:
             value = -value
 
     # -- single-tree search -------------------------------------------------
-    def search(self, pos: Position, root: Node | None = None, add_noise: bool = True) -> Node:
+    def search(self, pos: Position, root: Node | None = None, add_noise: bool = True,
+               seen: Mapping[int, int] | None = None) -> Node:
         root = root or Node(pos)
-        self.search_batch([root], add_noise=add_noise, leaves_per_tree=1)
+        self.search_batch([root], add_noise=add_noise, leaves_per_tree=1,
+                          seen=[seen] if seen is not None else None)
         return root
 
     # -- lockstep batched search ---------------------------------------------
     def search_batch(self, roots: list[Node], add_noise: bool = True,
-                     leaves_per_tree: int | None = None) -> None:
+                     leaves_per_tree: int | None = None,
+                     seen: list[Mapping[int, int]] | None = None) -> None:
+        """``seen``: per root, the game's position-occurrence counts so far
+        (``GameState.seen``), for repetition draws inside the tree."""
         lpt = leaves_per_tree or self.cfg.leaves_per_tree
         for r in roots:
             self._expand_root(r, add_noise)
@@ -185,8 +227,12 @@ class MCTS:
             for i, root in enumerate(roots):
                 k = min(lpt, remaining[i])
                 for _ in range(k):
-                    path = self._descend(root)
+                    path, rep = self._descend(root, seen[i] if seen is not None else None)
                     leaf = path[-1]
+                    if rep:
+                        self._backup(path, 0.0)       # third occurrence: draw for this visit
+                        remaining[i] -= 1
+                        continue
                     v = self._prepare(leaf)
                     if v is not None:
                         self._backup(path, v)

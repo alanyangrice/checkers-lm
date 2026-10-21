@@ -114,3 +114,43 @@ def test_virtual_loss_diversifies_leaves() -> None:
     # root first, then one round: the start position has 7 legal moves, so
     # 8 descents reach all 7 children (the 8th repeats one and is deduped)
     assert len(seen) == 1 + 7 and len(set(p.fen() for p in seen[1:])) == 7
+
+
+def test_repetition_in_tree_is_scored_as_draw() -> None:
+    """A child position already seen twice in the game (so a move there would be the
+    third occurrence) is backed up as a draw and never expanded; others are expanded."""
+    from dq.rules import zobrist
+    pos = Position.start()
+    moves = legal_moves(pos)
+    target = moves[0]
+    child_pos = apply_move(pos, target)
+    seen = {zobrist(pos): 1, zobrist(child_pos): 2}
+    m = MCTS(uniform_evaluator, SearchConfig(simulations=80, dirichlet_eps=0.0), rng=random.Random(0))
+    root = m.search(pos, add_noise=False, seen=seen)
+    rep = root.children[target]
+    assert rep.N > 0 and rep.prior == {} and rep.W == 0.0      # visited, drawn, not expanded
+    assert any(c.prior for mv, c in root.children.items() if mv != target)
+    # without `seen` the same child is expanded normally
+    root2 = m.search(pos, add_noise=False)
+    assert root2.children[target].prior
+
+
+def test_tablebase_leaf_respects_draw_ply_limit() -> None:
+    """A tablebase win whose DTM exceeds the active draw rule's ply limit is scored 0, not
+    +1 (e.g. 7.2.8: 10 plies for <=2 pieces incl. a king vs a lone king).  Real 3-piece
+    tables have no such position (2v1 wins are short), so a stub tablebase is used."""
+    from dq.game import draw_ply_limit
+    from dq.mcts import Node
+    from dq.rules import Position
+
+    class StubTB:
+        def covers(self, pos): return True
+        def probe(self, pos): return (WIN, 50)
+
+    from dq.rules import bit
+    p = Position(0, bit(18) | bit(22), 0, bit(1))      # two white kings vs a lone black king
+    assert draw_ply_limit(p) == 10
+    assert MCTS(uniform_evaluator, tablebase=StubTB())._prepare(Node(p)) == 1.0
+    assert MCTS(uniform_evaluator, tablebase=StubTB(), tb_ply_limit=draw_ply_limit)._prepare(Node(p)) == 0.0
+    # a position with no counting rule is untouched
+    assert MCTS(uniform_evaluator, tablebase=StubTB(), tb_ply_limit=draw_ply_limit)._prepare(Node(Position.start())) == 1.0

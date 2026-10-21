@@ -82,6 +82,15 @@ def active_draw_rule(pos: Position, king_moves: tuple[int, int]) -> Optional[Dra
     return None
 
 
+def draw_ply_limit(pos: Position) -> Optional[int]:
+    """Ply limit of the draw rule that would be active at ``pos`` with fresh
+    counters, or None if no counting rule applies.  Used to discount tablebase
+    wins that cannot be converted before adjudication (optimistic about the
+    counter's current value; pessimistic about resets by later captures)."""
+    r = active_draw_rule(pos, (0, 0))
+    return r.limit if r else None
+
+
 @dataclass
 class GameState:
     pos: Position

@@ -58,7 +58,7 @@ def test_tablebase_rescoring_overrides_game_outcome() -> None:
     g.records = [(pos, {legal_moves(pos)[0]: 1.0}), (Position.start(), {legal_moves(Position.start())[0]: 1.0})]
     plain = _finish(g)
     assert plain[0].wdl == WDL_D and plain[1].wdl == WDL_D
-    rescored = _finish(g, tb)
+    rescored = _finish(g, tb, draw_rules=False)
     expect = WDL_W if tb.probe(pos)[0] == WIN else WDL_L
     assert rescored[0].wdl == expect           # covered: exact tablebase value
     assert rescored[1].wdl == WDL_D            # start position: not covered, keeps outcome
@@ -83,3 +83,23 @@ def test_endgame_start_positions_are_legal_and_uncovered() -> None:
     assert seen_nonstart == 50
     cfg0 = SelfPlayConfig(endgame_start_frac=0.0)
     assert all(_start_position(cfg0, rng, tb) == Position.start() for _ in range(10))
+
+
+def test_tb_outcome_discounts_unconvertible_wins() -> None:
+    from dq.game import draw_ply_limit
+    from dq.rules import Position, bit
+    from dq.selfplay import tb_outcome
+    from dq.tablebase import DRAW, LOSS, WIN
+
+    class StubTB:
+        def __init__(self, v, d): self.v, self.d = v, d
+        def covers(self, pos): return True
+        def probe(self, pos): return (self.v, self.d)
+
+    p = Position(0, bit(18) | bit(22), 0, bit(1))          # 2 white kings vs lone black king: 7.2.8, 10 plies
+    assert draw_ply_limit(p) == 10
+    assert tb_outcome(StubTB(WIN, 50), p) == DRAW
+    assert tb_outcome(StubTB(WIN, 50), p, draw_rules=False) == WIN
+    assert tb_outcome(StubTB(LOSS, 50), p) == DRAW
+    assert tb_outcome(StubTB(WIN, 8), p) == WIN
+    assert tb_outcome(StubTB(WIN, 50), Position.start()) == WIN   # no counting rule applies

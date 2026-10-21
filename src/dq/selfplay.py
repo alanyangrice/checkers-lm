@@ -40,7 +40,7 @@ from pathlib import Path
 import torch
 import torch.multiprocessing as mp
 
-from dq.game import GameState
+from dq.game import GameState, draw_ply_limit
 from dq.mcts import MCTS, Node, SearchConfig
 from dq.model import (
     WDL_D, WDL_L, WDL_W, Example, ModelConfig, NetEvaluator, SquareTransformer, collate, loss_fn,
@@ -67,6 +67,7 @@ class SelfPlayConfig:
     endgame_start_frac: float = 0.0     # fraction of games started from a random endgame position (KataGo-style mixed starts)
     endgame_pieces: tuple[int, int] = (5, 8)   # total piece count range for those starts (must exceed tablebase coverage)
     tb_rescore: bool = False            # replace game-outcome value targets with exact tablebase WDL where covered (Lc0-style)
+    tb_draw_rules: bool = True          # score tablebase wins/losses with DTM beyond the active draw rule's ply limit as draws
     # training
     replay_buffer: int = 500_000
     min_buffer: int = 5_000
@@ -102,21 +103,38 @@ class _Game:
         self.records: list[tuple[Position, dict]] = []
 
 
-def _finish(g: _Game, tb: Tablebase | None = None) -> list[Example]:
+def tb_outcome(tb: Tablebase, pos: Position, draw_rules: bool = True) -> int | None:
+    """Tablebase WDL for the side to move, or None if not covered.  With ``draw_rules`` a
+    win/loss whose DTM exceeds the ply limit of the draw rule active at ``pos`` is a DRAW,
+    because the game would be adjudicated first (lidraughts 7.2.4–7.2.8)."""
+    if not tb.covers(pos):
+        return None
+    r = tb.probe(pos)
+    if r is None:
+        return None
+    v, dtm = r
+    if v != DRAW and draw_rules:
+        limit = draw_ply_limit(pos)
+        if limit is not None and dtm > limit:
+            return DRAW
+    return v
+
+
+def _finish(g: _Game, tb: Tablebase | None = None, draw_rules: bool = True) -> list[Example]:
     """Turn a finished game into training examples.
 
     With ``tb``, positions the tablebase covers get the exact WDL for the side to move as
     their value target instead of the (possibly misplayed) game outcome — the "tablebase
-    rescoring" used by Leela Chess Zero.
+    rescoring" used by Leela Chess Zero — discounted by the draw rules (:func:`tb_outcome`).
     """
     z_white = {1.0: 1.0, 0.5: 0.0, 0.0: -1.0}[g.state.result]
     out: list[Example] = []
     for p, pi in g.records:
         z = z_white if p.turn == WHITE else -z_white
-        if tb is not None and tb.covers(p):
-            r = tb.probe(p)
-            if r is not None:
-                z = float(r[0])          # WIN=1, DRAW=0, LOSS=-1, already side-to-move relative
+        if tb is not None:
+            v = tb_outcome(tb, p, draw_rules)
+            if v is not None:
+                z = float(v)             # WIN=1, DRAW=0, LOSS=-1, already side-to-move relative
         out.append(make_example(p, pi, z))
     return out
 
@@ -157,7 +175,7 @@ def worker_loop(wid: int, cfg: SelfPlayConfig, mcfg: ModelConfig, weights_dir: s
     tb = Tablebase.load(tb_dir) if tb_dir else None
     sc = SearchConfig(simulations=cfg.simulations, dirichlet_alpha=cfg.dirichlet_alpha,
                       dirichlet_eps=cfg.dirichlet_eps, leaves_per_tree=cfg.leaves_per_tree)
-    mcts = MCTS(ev, sc, tablebase=tb, rng=rng)
+    mcts = MCTS(ev, sc, tablebase=tb, rng=rng, tb_ply_limit=draw_ply_limit if cfg.tb_draw_rules else None)
     tb_score = tb if cfg.tb_rescore else None
     games = [_Game(mcts, _start_position(cfg, rng, tb)) for _ in range(cfg.games_per_worker)]
     t_last = time.time(); n_games = 0; n_moves = 0
@@ -168,7 +186,7 @@ def worker_loop(wid: int, cfg: SelfPlayConfig, mcfg: ModelConfig, weights_dir: s
     while not stop.is_set():
         if os.getppid() != parent:
             return                      # trainer died; don't run as an orphan
-        mcts.search_batch([g.root for g in games], add_noise=True)
+        mcts.search_batch([g.root for g in games], add_noise=True, seen=[g.state.seen for g in games])
         finished: list[Example] = []
         for i, g in enumerate(games):
             pi = mcts.policy_target(g.root)
@@ -180,7 +198,7 @@ def worker_loop(wid: int, cfg: SelfPlayConfig, mcfg: ModelConfig, weights_dir: s
             if g.state.over or len(g.state.history) >= cfg.max_plies:
                 if not g.state.over:
                     g.state.result, g.state.reason = 0.5, "max plies"
-                finished.extend(_finish(g, tb_score))
+                finished.extend(_finish(g, tb_score, cfg.tb_draw_rules))
                 n_games += 1
                 results[{1.0: "white", 0.5: "draw", 0.0: "black"}[g.state.result]] += 1
                 reasons[g.state.reason] = reasons.get(g.state.reason, 0) + 1
@@ -250,7 +268,8 @@ def match(ev_a: NetEvaluator, ev_b: NetEvaluator, games: int, sims: int, tb, rng
     same random ``opening_plies``-ply opening played once with each colour.
     ``raw_a`` makes A play its raw policy (no search)."""
     sc = SearchConfig(simulations=sims, dirichlet_eps=0.0, leaves_per_tree=8)
-    ma, mb = MCTS(ev_a, sc, tablebase=tb, rng=rng), MCTS(ev_b, sc, tablebase=tb, rng=rng)
+    ma = MCTS(ev_a, sc, tablebase=tb, rng=rng, tb_ply_limit=draw_ply_limit)
+    mb = MCTS(ev_b, sc, tablebase=tb, rng=rng, tb_ply_limit=draw_ply_limit)
     states = []
     for i in range(games):
         if i % 2 == 0:
@@ -294,7 +313,7 @@ def match(ev_a: NetEvaluator, ev_b: NetEvaluator, games: int, sims: int, tb, rng
                 if r is None or r.pos != states[i].pos:
                     r = Node(states[i].pos)
                 rs.append(r)
-            m.search_batch(rs, add_noise=False)
+            m.search_batch(rs, add_noise=False, seen=[states[i].seen for i in idx])
             for i, r in zip(idx, rs):
                 mv = m.select_move(r, 0.0)
                 states[i].push(mv)
@@ -336,7 +355,7 @@ def tablebase_wdl_error(model, tb: Tablebase, n: int, rng: random.Random, device
     ids = torch.tensor([encode_board(p) for p in positions], dtype=torch.long, device=device)
     pred = model(ids)["wdl"].argmax(-1).tolist()
     tmap = {WIN: WDL_W, DRAW: WDL_D, LOSS: WDL_L}
-    wrong = sum(1 for a, p in zip(pred, positions) if a != tmap[tb.probe(p)[0]])
+    wrong = sum(1 for a, p in zip(pred, positions) if a != tmap[tb_outcome(tb, p)])
     return wrong / n
 
 

@@ -46,6 +46,8 @@ def main() -> None:
     ap.add_argument("--endgame-start-frac", type=float, default=0.0,
                     help="fraction of self-play games started from a random 5-8 piece endgame instead of the start position")
     ap.add_argument("--endgame-pieces", type=int, nargs=2, default=(5, 8), metavar=("MIN", "MAX"))
+    ap.add_argument("--no-tb-draw-rules", action="store_true",
+                    help="score tablebase wins as wins even when DTM exceeds the active draw rule's ply limit")
     ap.add_argument("--anchor", default=None, help="fixed reference checkpoint played at every gate (vs_anchor)")
     ap.add_argument("--anchor-games", type=int, default=100)
     a = ap.parse_args()
@@ -56,7 +58,7 @@ def main() -> None:
                          max_plies=a.max_plies, seed=a.seed, autocast=not a.no_autocast,
                          gate_revert=a.gate_revert, tb_rescore=a.tb_rescore,
                          endgame_start_frac=a.endgame_start_frac, endgame_pieces=tuple(a.endgame_pieces),
-                         anchor=a.anchor, anchor_games=a.anchor_games)
+                         anchor=a.anchor, anchor_games=a.anchor_games, tb_draw_rules=not a.no_tb_draw_rules)
     mcfg = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128) if a.small else ModelConfig()
     run(a.out, a.rounds, cfg, mcfg, tb_dir=a.tb, device=a.device, resume=a.resume)
 
