@@ -162,12 +162,27 @@ tail -f runs/gen1/log.jsonl          # loss, games/round, gate results, promotio
 Windows (PowerShell) equivalents, as run on the 5090 box 2026-10-20 (torch 2.11+cu128, Python 3.12):
 ```
 uv pip install --python .venv torch --index-url https://download.pytorch.org/whl/cu128
-Start-Process .venv\Scripts\python.exe -ArgumentList "scripts/selfplay.py runs/gen1 ..." `
-    -RedirectStandardOutput runs\gen1.log -RedirectStandardError runs\gen1.err -WindowStyle Hidden
-Get-Content runs\gen1\log.jsonl -Wait -Tail 3    # trainer PID is in runs\gen1.pid; Stop-Process -Id <pid> to end
+powershell -File scripts\launch_run.ps1 -Name gen2 -Args "--rounds 2000 --workers 8 ... --tb data/tb"
+Get-Content runs\gen2\log.jsonl -Wait -Tail 3        # trainer PID in runs\gen2.pid
+powershell -File scripts\stop_run.ps1 -Name gen2
 ```
+`launch_run.ps1` runs the trainer as a hidden Windows scheduled task, so it is not a child of the
+shell that started it. Lesson from gen1: a `Start-Process` child of an agent/editor shell was killed
+silently (no traceback, log just stops) when that shell's process tree restarted; and a *visible*
+console window, if closed, aborts the run via the MKL/Fortran close handler (exit 0xC000013A).
+
 Measured round 0 on the 5090: 517 games / 120 s with 8 workers × 32 games × 200 sims
 (~4.3 games/s, ~45k positions/s), GPU ~65 %, 9.8 GB — in line with the estimate above.
+
+gen1 (64 rounds, ~2 h, start position only, no rescoring): policy 4.12→1.16 (plateau from ~round 45),
+WDL 0.74→0.47 (still falling), ncap →0.005, draw rate 8→42 %, tb_wdl_err 0.23→~0.10 (plateau from
+round 34), gates vs_prev 0.43–0.59 (noise at 40 games), raw_vs_prev 0.09–0.30 (freeze criterion
+far off). Weights: runs/gen1_final.pt.
+
+gen2 resumes from gen1_final.pt with `--tb-rescore` (exact tablebase WDL as the value target for
+covered positions, Lc0-style) and `--endgame-start-frac 0.2` (20 % of games start from a random
+5–8-piece position, KataGo-style mixed starts) — aimed at the tb_wdl_err plateau. Hypothesis to
+check: tb_wdl_err drops below 0.10 and WDL keeps falling; gate win rate is not expected to move.
 Watch: policy loss falling, draw rate rising from ~0, `tb_wdl_err` falling toward 0,
 `vs_prev` ≥ 0.55 on most gates, `raw_vs_prev` climbing (the freeze criterion).
 
