@@ -24,7 +24,7 @@ def test_batched_match_is_symmetric_and_handles_last_capture() -> None:
     ba = match(b, a, games=20, sims=16, tb=tb, rng=random.Random(0), max_plies=300)
     assert abs(ab + ba - 1.0) < 1e-9
     aa = match(a, a, games=10, sims=8, tb=None, rng=random.Random(0), max_plies=300)
-    assert aa == 0.5
+    assert aa == 0.5   # paired openings + deterministic search => exact mirror
     s_raw = match(a, b, games=4, sims=8, tb=None, rng=random.Random(0), max_plies=120, raw_a=True)
     assert 0.0 <= s_raw <= 1.0
 

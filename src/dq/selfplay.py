@@ -28,8 +28,10 @@ Gates (PLAN Phase 1), computed by the trainer every ``gate_every`` rounds:
 """
 from __future__ import annotations
 
+import faulthandler
 import json
 import os
+import signal
 import random
 import time
 from dataclasses import asdict, dataclass
@@ -75,6 +77,7 @@ class SelfPlayConfig:
     eval_games: int = 40
     eval_sims: int = 100
     promote_threshold: float = 0.55
+    gate_revert: bool = False           # AlphaGo-Zero style: reject and revert on a failed gate
     tb_samples: int = 2000
     # misc
     seed: int = 0
@@ -101,6 +104,7 @@ def _finish(g: _Game) -> list[Example]:
 
 def worker_loop(wid: int, cfg: SelfPlayConfig, mcfg: ModelConfig, weights_dir: str, out_q: mp.Queue,
                 stop: mp.Event, tb_dir: str | None, device: str) -> None:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
     torch.set_num_threads(1)
     rng = random.Random(cfg.seed * 1000 + wid)
     torch.manual_seed(cfg.seed * 1000 + wid)
@@ -117,7 +121,10 @@ def worker_loop(wid: int, cfg: SelfPlayConfig, mcfg: ModelConfig, weights_dir: s
     results = {"white": 0, "draw": 0, "black": 0}
     reasons: dict[str, int] = {}
 
+    parent = os.getppid()
     while not stop.is_set():
+        if os.getppid() != parent:
+            return                      # trainer died; don't run as an orphan
         mcts.search_batch([g.root for g in games], add_noise=True)
         finished: list[Example] = []
         for i, g in enumerate(games):
@@ -138,7 +145,10 @@ def worker_loop(wid: int, cfg: SelfPlayConfig, mcfg: ModelConfig, weights_dir: s
             else:
                 g.root = MCTS.advance(g.root, mv) if cfg.tree_reuse else Node(g.state.pos)
         if finished:
-            out_q.put((wid, version, finished))
+            try:
+                out_q.put((wid, version, finished), timeout=60)
+            except Exception:
+                pass                        # trainer unresponsive; drop the games rather than wedge
             # pick up new weights between games
             version = _load_latest(model, weights_dir, version, dev)
         if time.time() - t_last > 30:
@@ -190,13 +200,27 @@ def train_steps(model, opt, buffer: list[Example], cfg: SelfPlayConfig, device, 
 
 
 def match(ev_a: NetEvaluator, ev_b: NetEvaluator, games: int, sims: int, tb, rng: random.Random,
-          max_plies: int = 300, raw_a: bool = False) -> float:
-    """Score of A over ``games`` games (alternating colours), all played
-    concurrently: each side's searches are batched across the games it is
-    to move in.  ``raw_a`` makes A play its raw policy (no search)."""
+          max_plies: int = 300, raw_a: bool = False, opening_plies: int = 6) -> float:
+    """Score of A over ``games`` games, all played concurrently: each side's
+    searches are batched across the games it is to move in.  Search is
+    deterministic (T=0, no noise), so every pair of games starts from the
+    same random ``opening_plies``-ply opening played once with each colour.
+    ``raw_a`` makes A play its raw policy (no search)."""
     sc = SearchConfig(simulations=sims, dirichlet_eps=0.0, leaves_per_tree=8)
     ma, mb = MCTS(ev_a, sc, tablebase=tb, rng=rng), MCTS(ev_b, sc, tablebase=tb, rng=rng)
-    states = [GameState(Position.start()) for _ in range(games)]
+    states = []
+    for i in range(games):
+        if i % 2 == 0:
+            g = GameState(Position.start())
+            for _ in range(opening_plies):
+                if g.over:
+                    break
+                g.push(rng.choice(g.legal()))
+            opening = [mv for _, mv in g.history]
+        g = GameState(Position.start())
+        for mv in opening:
+            g.push(mv)
+        states.append(g)
     a_is_white = [i % 2 == 0 for i in range(games)]
     roots: list[Node | None] = [None] * games
     while True:
@@ -272,6 +296,7 @@ def _publish(model, weights_dir: Path, version: int) -> None:
 
 def run(out_dir: str | Path, rounds: int, cfg: SelfPlayConfig, mcfg: ModelConfig | None = None,
         tb_dir: str | None = None, device: str | None = None, resume: str | None = None) -> None:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)   # kill -USR1 <pid> dumps all stacks to stderr
     mcfg = mcfg or ModelConfig()
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     weights_dir = out / "weights"; weights_dir.mkdir(exist_ok=True)
@@ -304,13 +329,18 @@ def run(out_dir: str | Path, rounds: int, cfg: SelfPlayConfig, mcfg: ModelConfig
     stats: dict[int, dict] = {}
     try:
         for rnd in range(rounds):
-            t0 = time.time(); n_new = 0; n_games = 0
+            t0 = time.time(); n_new = 0; n_games = 0; t_last_item = time.time()
             while time.time() - t0 < cfg.round_seconds or len(buffer) < cfg.min_buffer:
                 try:
                     wid, ver, payload = q.get(timeout=1.0)
+                    t_last_item = time.time()
                 except Exception:
                     if not any(p.is_alive() for p in procs):
                         raise RuntimeError("all workers died")
+                    if time.time() - t_last_item > 120:
+                        print(json.dumps({"warn": "no games received for 120s", "qsize": q.qsize(),
+                                          "alive": [p.is_alive() for p in procs], "stats": stats}), flush=True)
+                        t_last_item = time.time()
                     continue
                 if isinstance(payload, dict):
                     stats[wid] = payload
@@ -327,8 +357,8 @@ def run(out_dir: str | Path, rounds: int, cfg: SelfPlayConfig, mcfg: ModelConfig
                 ev_out = gate(model, prev, cfg, tb, device_t, rng)
                 promoted = ev_out["vs_prev"] >= cfg.promote_threshold
                 rec["gate"] = ev_out; rec["promoted"] = promoted
-                if promoted:
-                    prev.load_state_dict(model.state_dict())
+                if promoted or not cfg.gate_revert:
+                    prev.load_state_dict(model.state_dict())      # new reference for the next gate
                     version += 1
                     _publish(model, weights_dir, version)
                     torch.save(model.state_dict(), out / f"gen_{version:03d}.pt")

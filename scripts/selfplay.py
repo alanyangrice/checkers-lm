@@ -39,13 +39,15 @@ def main() -> None:
     ap.add_argument("--resume", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-autocast", action="store_true")
+    ap.add_argument("--gate-revert", action="store_true", help="revert to the previous checkpoint when a gate fails")
     ap.add_argument("--small", action="store_true", help="tiny model for smoke tests")
     a = ap.parse_args()
     cfg = SelfPlayConfig(workers=a.workers, games_per_worker=a.games_per_worker, simulations=a.sims,
                          leaves_per_tree=a.leaves_per_tree, round_seconds=a.round_seconds,
                          min_buffer=a.min_buffer, train_steps_per_round=a.train_steps, batch_size=a.batch,
                          lr=a.lr, gate_every=a.gate_every, eval_games=a.eval_games, eval_sims=a.eval_sims,
-                         max_plies=a.max_plies, seed=a.seed, autocast=not a.no_autocast)
+                         max_plies=a.max_plies, seed=a.seed, autocast=not a.no_autocast,
+                         gate_revert=a.gate_revert)
     mcfg = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128) if a.small else ModelConfig()
     run(a.out, a.rounds, cfg, mcfg, tb_dir=a.tb, device=a.device, resume=a.resume)
 
