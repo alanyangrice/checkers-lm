@@ -193,6 +193,23 @@ Lc0 / KataGo step-down after the initial phase), everything else fixed, with `--
 runs/gen1_final.pt` so each gate logs `vs_anchor` as a trend line. If gen3 is also flat, next
 levers in order: more sims per move (better targets), larger replay ratio check, bigger model.
 
+**Code review 2026-10-21 (commits b08defd, 3992792):** (1) the gate's `raw_vs_prev` played the raw
+policy against *100-sim* search, not the PLAN's 1-node criterion — `raw_vs_1node` added; (2) search now
+scores a third occurrence of a position as a draw (7.2.3), using the game's `seen` counts plus the
+path from the root — threefold endings fell from ~7 % to ~2.5 % of games immediately; (3) tablebase
+wins/losses whose DTM exceeds the active draw rule's ply limit are scored as draws in search, in
+`--tb-rescore` targets and in `tb_wdl_err` (`--no-tb-draw-rules` disables). Measured on the 4-piece
+tables this touches only 0.1 % of decisive positions (7.2.6); 2-vs-1 wins are always within 7.2.8's
+10 plies. It matters once 5–6-piece tables exist. Draw *counters* are still not tracked in the tree.
+
+Game-ending reasons (cumulative): 7.2.8 (≤2 pieces incl. a king vs lone king, 10 plies) has grown
+from 28 % of games (gen1) to ~50 % (gen4), with "no moves" ~44 % and draws 55–58 % overall. With
+flying kings, K vs K and most KK vs K are tablebase draws, so equal-strength self-play collapses
+into them. Not a bug, but half the games now carry a zero value target — a reason to consider
+oversampling decisive/tactical starts (PLAN §7 risk 3) if the value head stalls.
+
+gen4 = gen3 weights + the review fixes, same LR 2e-4 (restarted at gen3 round 13; buffer lost).
+
 gen2 resumed from gen1_final.pt with `--tb-rescore` (exact tablebase WDL as the value target for
 covered positions, Lc0-style) and `--endgame-start-frac 0.2` (20 % of games start from a random
 5–8-piece position, KataGo-style mixed starts) — aimed at the tb_wdl_err plateau. Hypothesis to
