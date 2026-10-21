@@ -343,7 +343,10 @@ def tablebase_wdl_error(model, tb: Tablebase, n: int, rng: random.Random, device
 def gate(model, prev, cfg: SelfPlayConfig, tb, device, rng, anchor=None) -> dict[str, float]:
     ev, ev_prev = NetEvaluator(model, device), NetEvaluator(prev, device)
     out = {"vs_prev": match(ev, ev_prev, cfg.eval_games, cfg.eval_sims, tb, rng, cfg.max_plies),
-           "raw_vs_prev": match(ev, ev_prev, cfg.eval_games, cfg.eval_sims, tb, rng, cfg.max_plies, raw_a=True)}
+           # raw policy vs the previous checkpoint *with* eval_sims search: a hard bar, expected low
+           "raw_vs_prev": match(ev, ev_prev, cfg.eval_games, cfg.eval_sims, tb, rng, cfg.max_plies, raw_a=True),
+           # raw policy vs the previous checkpoint at 1 node: the PLAN Phase 1 freeze criterion (>0.80)
+           "raw_vs_1node": match(ev, ev_prev, cfg.eval_games, 1, tb, rng, cfg.max_plies, raw_a=True)}
     if anchor is not None:
         # fixed reference checkpoint: a trend line, where vs_prev (5 rounds apart) is mostly noise
         out["vs_anchor"] = match(ev, NetEvaluator(anchor, device), cfg.anchor_games, cfg.eval_sims, tb, rng, cfg.max_plies)
