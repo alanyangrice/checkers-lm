@@ -159,6 +159,15 @@ nohup .venv/bin/python scripts/selfplay.py runs/gen1 --rounds 2000 --workers 8 \
     --gate-every 5 --eval-games 40 --eval-sims 100 --tb data/tb > runs/gen1.log 2>&1 &
 tail -f runs/gen1/log.jsonl          # loss, games/round, gate results, promotions
 ```
+Windows (PowerShell) equivalents, as run on the 5090 box 2026-10-20 (torch 2.11+cu128, Python 3.12):
+```
+uv pip install --python .venv torch --index-url https://download.pytorch.org/whl/cu128
+Start-Process .venv\Scripts\python.exe -ArgumentList "scripts/selfplay.py runs/gen1 ..." `
+    -RedirectStandardOutput runs\gen1.log -RedirectStandardError runs\gen1.err -WindowStyle Hidden
+Get-Content runs\gen1\log.jsonl -Wait -Tail 3    # trainer PID is in runs\gen1.pid; Stop-Process -Id <pid> to end
+```
+Measured round 0 on the 5090: 517 games / 120 s with 8 workers × 32 games × 200 sims
+(~4.3 games/s, ~45k positions/s), GPU ~65 %, 9.8 GB — in line with the estimate above.
 Watch: policy loss falling, draw rate rising from ~0, `tb_wdl_err` falling toward 0,
 `vs_prev` ≥ 0.55 on most gates, `raw_vs_prev` climbing (the freeze criterion).
 
