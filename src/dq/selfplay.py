@@ -82,6 +82,8 @@ class SelfPlayConfig:
     promote_threshold: float = 0.55
     gate_revert: bool = False           # AlphaGo-Zero style: reject and revert on a failed gate
     tb_samples: int = 2000
+    anchor: str | None = None           # checkpoint path; each gate also plays it (vs_anchor) as a fixed reference
+    anchor_games: int = 100
     # misc
     seed: int = 0
     autocast: bool = True
@@ -263,7 +265,9 @@ def match(ev_a: NetEvaluator, ev_b: NetEvaluator, games: int, sims: int, tb, rng
             g.push(mv)
         states.append(g)
     a_is_white = [i % 2 == 0 for i in range(games)]
-    roots: list[Node | None] = [None] * games
+    # one tree per *player* per game: sharing a tree would hand each side the other's priors and
+    # values and blend the two networks (compressing every match score toward 0.5)
+    roots_by_side: dict[bool, list[Node | None]] = {True: [None] * games, False: [None] * games}
     while True:
         live = [i for i, g in enumerate(states) if not g.over and len(g.history) < max_plies]
         if not live:
@@ -281,11 +285,15 @@ def match(ev_a: NetEvaluator, ev_b: NetEvaluator, games: int, sims: int, tb, rng
                     (prior, _), = ev_a([g.pos], [moves])
                     g.push(max(moves, key=lambda mv: prior[mv]))
                 continue
+            roots = roots_by_side[side_a]
             rs = []
             for i in idx:
-                if roots[i] is None or roots[i].pos != states[i].pos:
-                    roots[i] = Node(states[i].pos)
-                rs.append(roots[i])
+                r = roots[i]
+                if r is not None and len(states[i].history) >= 1:
+                    r = MCTS.advance(r, states[i].history[-1][1])     # follow the opponent's reply
+                if r is None or r.pos != states[i].pos:
+                    r = Node(states[i].pos)
+                rs.append(r)
             m.search_batch(rs, add_noise=False)
             for i, r in zip(idx, rs):
                 mv = m.select_move(r, 0.0)
@@ -295,7 +303,20 @@ def match(ev_a: NetEvaluator, ev_b: NetEvaluator, games: int, sims: int, tb, rng
     for g, aw in zip(states, a_is_white):
         res = g.result if g.result is not None else 0.5
         score += res if aw else 1.0 - res
+    match.last_wdl = _wdl_counts(states, a_is_white)
     return score / games
+
+
+def _wdl_counts(states, a_is_white) -> tuple[int, int, int]:
+    """(wins, draws, losses) for A, for diagnostics."""
+    w = d = l = 0
+    for g, aw in zip(states, a_is_white):
+        res = g.result if g.result is not None else 0.5
+        s = res if aw else 1.0 - res
+        if s > 0.5: w += 1
+        elif s < 0.5: l += 1
+        else: d += 1
+    return w, d, l
 
 
 def raw_policy(ev: NetEvaluator):
@@ -319,10 +340,14 @@ def tablebase_wdl_error(model, tb: Tablebase, n: int, rng: random.Random, device
     return wrong / n
 
 
-def gate(model, prev, cfg: SelfPlayConfig, tb, device, rng) -> dict[str, float]:
+def gate(model, prev, cfg: SelfPlayConfig, tb, device, rng, anchor=None) -> dict[str, float]:
     ev, ev_prev = NetEvaluator(model, device), NetEvaluator(prev, device)
     out = {"vs_prev": match(ev, ev_prev, cfg.eval_games, cfg.eval_sims, tb, rng, cfg.max_plies),
            "raw_vs_prev": match(ev, ev_prev, cfg.eval_games, cfg.eval_sims, tb, rng, cfg.max_plies, raw_a=True)}
+    if anchor is not None:
+        # fixed reference checkpoint: a trend line, where vs_prev (5 rounds apart) is mostly noise
+        out["vs_anchor"] = match(ev, NetEvaluator(anchor, device), cfg.anchor_games, cfg.eval_sims, tb, rng, cfg.max_plies)
+        out["vs_anchor_wdl"] = list(match.last_wdl)
     if tb is not None:
         out["tb_wdl_err"] = tablebase_wdl_error(model, tb, cfg.tb_samples, rng, device)
     return out
@@ -354,6 +379,10 @@ def run(out_dir: str | Path, rounds: int, cfg: SelfPlayConfig, mcfg: ModelConfig
     prev = SquareTransformer(mcfg).to(device_t); prev.load_state_dict(model.state_dict()); prev.eval()
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     tb = Tablebase.load(tb_dir) if tb_dir else None
+    anchor = None
+    if cfg.anchor:
+        anchor = SquareTransformer(mcfg).to(device_t)
+        anchor.load_state_dict(torch.load(cfg.anchor, map_location=device_t)); anchor.eval()
     (out / "config.json").write_text(json.dumps({"selfplay": asdict(cfg), "model": asdict(mcfg)}, indent=1))
     log = open(out / "log.jsonl", "a")
     print(f"device={dev_name} params={model.n_params():,} workers={cfg.workers}", flush=True)
@@ -395,7 +424,7 @@ def run(out_dir: str | Path, rounds: int, cfg: SelfPlayConfig, mcfg: ModelConfig
                    "buffer": len(buffer), "loss": losses, "t_gen": round(t_gen, 1), "t_train": round(t_train, 1),
                    "worker_stats": stats}
             if (rnd + 1) % cfg.gate_every == 0:
-                ev_out = gate(model, prev, cfg, tb, device_t, rng)
+                ev_out = gate(model, prev, cfg, tb, device_t, rng, anchor)
                 promoted = ev_out["vs_prev"] >= cfg.promote_threshold
                 rec["gate"] = ev_out; rec["promoted"] = promoted
                 if promoted or not cfg.gate_revert:
