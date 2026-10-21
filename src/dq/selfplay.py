@@ -102,9 +102,16 @@ def _finish(g: _Game) -> list[Example]:
     return [make_example(p, pi, z_white if p.turn == WHITE else -z_white) for p, pi in g.records]
 
 
+def _register_stack_dump() -> None:
+    """On POSIX, `kill -USR1 <pid>` dumps all thread stacks to stderr. No-op on Windows."""
+    sig = getattr(signal, "SIGUSR1", None)
+    if sig is not None:
+        faulthandler.register(sig, all_threads=True)
+
+
 def worker_loop(wid: int, cfg: SelfPlayConfig, mcfg: ModelConfig, weights_dir: str, out_q: mp.Queue,
                 stop: mp.Event, tb_dir: str | None, device: str) -> None:
-    faulthandler.register(signal.SIGUSR1, all_threads=True)
+    _register_stack_dump()
     torch.set_num_threads(1)
     rng = random.Random(cfg.seed * 1000 + wid)
     torch.manual_seed(cfg.seed * 1000 + wid)
@@ -296,7 +303,7 @@ def _publish(model, weights_dir: Path, version: int) -> None:
 
 def run(out_dir: str | Path, rounds: int, cfg: SelfPlayConfig, mcfg: ModelConfig | None = None,
         tb_dir: str | None = None, device: str | None = None, resume: str | None = None) -> None:
-    faulthandler.register(signal.SIGUSR1, all_threads=True)   # kill -USR1 <pid> dumps all stacks to stderr
+    _register_stack_dump()   # kill -USR1 <pid> dumps all stacks to stderr (POSIX only)
     mcfg = mcfg or ModelConfig()
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     weights_dir = out / "weights"; weights_dir.mkdir(exist_ok=True)
