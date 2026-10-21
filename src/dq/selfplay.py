@@ -62,8 +62,21 @@ class SelfPlayConfig:
     temperature_plies: int = 20
     temperature_late: float = 0.25
     max_plies: int = 300
-    dirichlet_alpha: float = 0.3
-    dirichlet_eps: float = 0.25
+    # AlphaZero (Silver et al. 2018) scales alpha inversely with the move count: 0.3 chess (~35
+    # moves), 0.15 shogi, 0.03 Go.  Brazilian draughts has ~7-8 legal moves => ~1.2.
+    dirichlet_alpha: float = 1.2
+    dirichlet_eps: float = 0.35
+    contempt: float = 0.0               # Lc0-style search-time draw contempt in self-play (labels untouched)
+    # decisive-start curriculum (checkers-rl): a fraction of games start from a random position
+    # where one side has strictly more material, the strong colour chosen 50/50
+    asym_start_frac: float = 0.0
+    asym_weak: tuple[int, int] = (3, 9)       # weak side's piece count range
+    asym_extra: int = 5                       # strong side has weak+1 .. weak+asym_extra (capped at 12)
+    # regret buffer (checkers-rl): positions where |root Q - outcome| > regret_threshold are kept
+    # per worker and a fraction of new games start from them
+    regret_start_frac: float = 0.0
+    regret_threshold: float = 0.5
+    regret_buffer: int = 5000
     tree_reuse: bool = True
     endgame_start_frac: float = 0.0     # fraction of games started from a random endgame position (KataGo-style mixed starts)
     endgame_pieces: tuple[int, int] = (5, 8)   # total piece count range for those starts (must exceed tablebase coverage)
@@ -101,7 +114,7 @@ class _Game:
     def __init__(self, mcts: MCTS, start: Position) -> None:
         self.state = GameState(start)
         self.root = Node(start)
-        self.records: list[tuple[Position, dict]] = []
+        self.records: list[tuple[Position, dict, float]] = []     # (pos, policy target, root Q for the mover)
 
 
 def tb_outcome(tb: Tablebase, pos: Position, draw_rules: bool = True) -> int | None:
@@ -121,8 +134,11 @@ def tb_outcome(tb: Tablebase, pos: Position, draw_rules: bool = True) -> int | N
     return v
 
 
-def _finish(g: _Game, tb: Tablebase | None = None, draw_rules: bool = True) -> list[Example]:
-    """Turn a finished game into training examples.
+def _finish(g: _Game, tb: Tablebase | None = None, draw_rules: bool = True,
+            regret_threshold: float | None = None) -> tuple[list[Example], list[Position]]:
+    """Turn a finished game into training examples, plus the "regret" positions where the
+    search's root value disagreed with the final (or tablebase) outcome by more than
+    ``regret_threshold`` (checkers-rl's regret buffer; None disables).
 
     With ``tb``, positions the tablebase covers get the exact WDL for the side to move as
     their value target instead of the (possibly misplayed) game outcome — the "tablebase
@@ -130,29 +146,56 @@ def _finish(g: _Game, tb: Tablebase | None = None, draw_rules: bool = True) -> l
     """
     z_white = {1.0: 1.0, 0.5: 0.0, 0.0: -1.0}[g.state.result]
     out: list[Example] = []
-    for p, pi in g.records:
+    regret: list[Position] = []
+    for p, pi, q in g.records:
         z = z_white if p.turn == WHITE else -z_white
         if tb is not None:
             v = tb_outcome(tb, p, draw_rules)
             if v is not None:
                 z = float(v)             # WIN=1, DRAW=0, LOSS=-1, already side-to-move relative
         out.append(make_example(p, pi, z))
-    return out
+        if regret_threshold is not None and abs(q - z) > regret_threshold and (tb is None or not tb.covers(p)):
+            regret.append(p)
+    return out, regret
 
 
-def _start_position(cfg: SelfPlayConfig, rng: random.Random, tb: Tablebase | None) -> Position:
-    """Initial position for a new self-play game: the standard start, or (with probability
-    ``cfg.endgame_start_frac``) a random legal endgame with a piece count above tablebase
-    coverage, so search can resolve it exactly while the net still has to judge it."""
-    if cfg.endgame_start_frac <= 0 or rng.random() >= cfg.endgame_start_frac:
-        return Position.start()
-    lo, hi = cfg.endgame_pieces
-    for _ in range(50):
-        total = rng.randint(lo, hi)
-        n_white = rng.randint(max(1, total - (total // 2 + 1)), min(total - 1, total // 2 + 1))
-        pos = random_position(rng, n_white, total - n_white)
-        if (tb is None or not tb.covers(pos)) and legal_moves(pos) and not GameState(pos).over:
-            return pos
+def _legal_start(pos: Position, tb: Tablebase | None) -> bool:
+    return (tb is None or not tb.covers(pos)) and bool(legal_moves(pos)) and not GameState(pos).over
+
+
+def _start_position(cfg: SelfPlayConfig, rng: random.Random, tb: Tablebase | None,
+                    regret: "list[Position] | None" = None) -> Position:
+    """Initial position for a new self-play game.  In order of precedence, each with its
+    configured probability: a regret-buffer position (where search misjudged the outcome);
+    a guaranteed-asymmetric material position (one side strictly ahead, strong colour 50/50
+    — checkers-rl's curriculum, so the game is likely decisive); a random endgame above
+    tablebase coverage; otherwise the standard start."""
+    r = rng.random()
+    if r < cfg.regret_start_frac:
+        for _ in range(10 if regret else 0):
+            pos = regret[rng.randrange(len(regret))]
+            if _legal_start(pos, tb):
+                return pos
+        return Position.start()          # empty buffer (early in a run): the slot is a standard start
+    r -= cfg.regret_start_frac
+    if r < cfg.asym_start_frac:
+        lo, hi = cfg.asym_weak
+        for _ in range(50):
+            weak = rng.randint(lo, hi)
+            strong = rng.randint(weak + 1, min(12, weak + cfg.asym_extra))
+            n_white, n_black = (strong, weak) if rng.random() < 0.5 else (weak, strong)
+            pos = random_position(rng, n_white, n_black)
+            if _legal_start(pos, tb):
+                return pos
+    r -= cfg.asym_start_frac
+    if r < cfg.endgame_start_frac:
+        lo, hi = cfg.endgame_pieces
+        for _ in range(50):
+            total = rng.randint(lo, hi)
+            n_white = rng.randint(max(1, total - (total // 2 + 1)), min(total - 1, total // 2 + 1))
+            pos = random_position(rng, n_white, total - n_white)
+            if _legal_start(pos, tb):
+                return pos
     return Position.start()
 
 
@@ -172,16 +215,19 @@ def worker_loop(wid: int, cfg: SelfPlayConfig, mcfg: ModelConfig, weights_dir: s
     dev = torch.device(device)
     model = SquareTransformer(mcfg).to(dev)
     version = _load_latest(model, weights_dir, -1, dev)
-    ev = NetEvaluator(model, dev, autocast=cfg.autocast)
+    ev = NetEvaluator(model, dev, autocast=cfg.autocast, contempt=cfg.contempt)
     tb = Tablebase.load(tb_dir) if tb_dir else None
     sc = SearchConfig(simulations=cfg.simulations, dirichlet_alpha=cfg.dirichlet_alpha,
                       dirichlet_eps=cfg.dirichlet_eps, leaves_per_tree=cfg.leaves_per_tree)
     mcts = MCTS(ev, sc, tablebase=tb, rng=rng, tb_ply_limit=draw_ply_limit if cfg.tb_draw_rules else None)
     tb_score = tb if cfg.tb_rescore else None
+    regret: list[Position] = []
+    regret_thr = cfg.regret_threshold if cfg.regret_start_frac > 0 else None
     games = [_Game(mcts, _start_position(cfg, rng, tb)) for _ in range(cfg.games_per_worker)]
     t_last = time.time(); n_games = 0; n_moves = 0
     results = {"white": 0, "draw": 0, "black": 0}
     reasons: dict[str, int] = {}
+    starts = {"standard": 0, "other": 0}
 
     parent = os.getppid()
     while not stop.is_set():
@@ -191,7 +237,7 @@ def worker_loop(wid: int, cfg: SelfPlayConfig, mcfg: ModelConfig, weights_dir: s
         finished: list[Example] = []
         for i, g in enumerate(games):
             pi = mcts.policy_target(g.root)
-            g.records.append((g.state.pos, pi))
+            g.records.append((g.state.pos, pi, g.root.Q))
             t = 1.0 if len(g.state.history) < cfg.temperature_plies else cfg.temperature_late
             mv = mcts.select_move(g.root, t)
             g.state.push(mv)
@@ -199,11 +245,17 @@ def worker_loop(wid: int, cfg: SelfPlayConfig, mcfg: ModelConfig, weights_dir: s
             if g.state.over or len(g.state.history) >= cfg.max_plies:
                 if not g.state.over:
                     g.state.result, g.state.reason = 0.5, "max plies"
-                finished.extend(_finish(g, tb_score, cfg.tb_draw_rules))
+                exs, reg = _finish(g, tb_score, cfg.tb_draw_rules, regret_thr)
+                finished.extend(exs)
+                if reg:
+                    regret.extend(reg)
+                    del regret[:-cfg.regret_buffer]
                 n_games += 1
                 results[{1.0: "white", 0.5: "draw", 0.0: "black"}[g.state.result]] += 1
                 reasons[g.state.reason] = reasons.get(g.state.reason, 0) + 1
-                games[i] = _Game(mcts, _start_position(cfg, rng, tb))
+                start = _start_position(cfg, rng, tb, regret)
+                starts["standard" if start == Position.start() else "other"] += 1
+                games[i] = _Game(mcts, start)
             else:
                 g.root = MCTS.advance(g.root, mv) if cfg.tree_reuse else Node(g.state.pos)
         if finished:
@@ -216,7 +268,8 @@ def worker_loop(wid: int, cfg: SelfPlayConfig, mcfg: ModelConfig, weights_dir: s
         if time.time() - t_last > 30:
             out_q.put((wid, version, {"stat": True, "games": n_games, "moves": n_moves,
                                       "evals": ev.calls, "positions": ev.positions,
-                                      "results": dict(results), "reasons": dict(reasons)}))
+                                      "results": dict(results), "reasons": dict(reasons),
+                                      "starts": dict(starts), "regret_buffer": len(regret)}))
             t_last = time.time()
 
 

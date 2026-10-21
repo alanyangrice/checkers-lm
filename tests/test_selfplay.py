@@ -55,10 +55,10 @@ def test_tablebase_rescoring_overrides_game_outcome() -> None:
     g = _Game.__new__(_Game)
     from dq.game import GameState
     g.state = GameState(pos); g.state.result = 0.5          # pretend the game was drawn
-    g.records = [(pos, {legal_moves(pos)[0]: 1.0}), (Position.start(), {legal_moves(Position.start())[0]: 1.0})]
-    plain = _finish(g)
+    g.records = [(pos, {legal_moves(pos)[0]: 1.0}, 0.0), (Position.start(), {legal_moves(Position.start())[0]: 1.0}, 0.0)]
+    plain, _ = _finish(g)
     assert plain[0].wdl == WDL_D and plain[1].wdl == WDL_D
-    rescored = _finish(g, tb, draw_rules=False)
+    rescored, _ = _finish(g, tb, draw_rules=False)
     expect = WDL_W if tb.probe(pos)[0] == WIN else WDL_L
     assert rescored[0].wdl == expect           # covered: exact tablebase value
     assert rescored[1].wdl == WDL_D            # start position: not covered, keeps outcome
@@ -103,3 +103,69 @@ def test_tb_outcome_discounts_unconvertible_wins() -> None:
     assert tb_outcome(StubTB(LOSS, 50), p) == DRAW
     assert tb_outcome(StubTB(WIN, 8), p) == WIN
     assert tb_outcome(StubTB(WIN, 50), Position.start()) == WIN   # no counting rule applies
+
+
+def test_contempt_is_root_relative_and_zero_sum() -> None:
+    """v = P(w)-P(l) - c*P(d) when the leaf mover is the root side, + c*P(d) otherwise, so the
+    sign-flipping backup keeps the search zero-sum (Lc0 WDL contempt)."""
+    from dq.rules import BLACK, WHITE, Position, legal_moves
+    from dq.model import WDL_D, WDL_L, WDL_W
+    import torch
+
+    model = _net(0)
+    plain = NetEvaluator(model)
+    con = NetEvaluator(model, contempt=0.3)
+    p = Position.start()                       # white to move
+    ms = legal_moves(p)
+    (_, v0), = plain([p], [ms])
+    (_, v_root), = con([p], [ms], [WHITE])     # root side == leaf mover: draws penalised
+    (_, v_opp), = con([p], [ms], [BLACK])      # root side is the opponent: draws rewarded
+    with torch.no_grad():
+        from dq.tokens import encode_board
+        wdl = torch.softmax(model(torch.tensor([encode_board(p)]))["wdl"].float(), -1)[0]
+    pd = wdl[WDL_D].item()
+    assert abs(v_root - (v0 - 0.3 * pd)) < 1e-5
+    assert abs(v_opp - (v0 + 0.3 * pd)) < 1e-5
+    (_, v_none), = con([p], [ms])              # no root info => plain value
+    assert abs(v_none - v0) < 1e-6
+
+
+def test_asymmetric_starts_have_strict_material_edge() -> None:
+    from dq.game import GameState
+    from dq.rules import legal_moves
+    from dq.selfplay import SelfPlayConfig, _start_position
+
+    tb = Tablebase(); tb.build(3)
+    rng = random.Random(1)
+    cfg = SelfPlayConfig(asym_start_frac=1.0, asym_weak=(3, 6), asym_extra=4)
+    white_strong = 0
+    for _ in range(60):
+        p = _start_position(cfg, rng, tb)
+        nw = bin(p.wm | p.wk).count("1"); nb = bin(p.bm | p.bk).count("1")
+        assert nw != nb and 3 <= min(nw, nb) <= 6 and 1 <= abs(nw - nb) <= 4
+        assert legal_moves(p) and not GameState(p).over and not tb.covers(p)
+        white_strong += nw > nb
+    assert 10 < white_strong < 50               # strong colour is rerolled 50/50
+
+
+def test_regret_positions_and_regret_starts() -> None:
+    from dq.game import GameState
+    from dq.rules import Position, legal_moves
+    from dq.selfplay import SelfPlayConfig, _Game, _finish, _start_position
+
+    pos = Position.start()
+    g = _Game.__new__(_Game)
+    g.state = GameState(pos); g.state.result = 1.0            # white won
+    mv = legal_moves(pos)[0]
+    # record 1: white to move, root Q said +0.9, outcome +1 -> no regret
+    # record 2: after mv, black to move, root Q said +0.8 for black, outcome -1 -> regret
+    from dq.rules import apply_move
+    p2 = apply_move(pos, mv)
+    g.records = [(pos, {mv: 1.0}, 0.9), (p2, {legal_moves(p2)[0]: 1.0}, 0.8)]
+    exs, regret = _finish(g, None, True, regret_threshold=0.5)
+    assert len(exs) == 2 and regret == [p2]
+    _, none = _finish(g, None, True, regret_threshold=None)
+    assert none == []
+    cfg = SelfPlayConfig(regret_start_frac=1.0)
+    assert _start_position(cfg, random.Random(0), None, [p2]) == p2
+    assert _start_position(cfg, random.Random(0), None, []) == Position.start()

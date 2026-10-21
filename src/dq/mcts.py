@@ -102,6 +102,7 @@ class MCTS:
         self.tb = tablebase
         self.tb_ply_limit = tb_ply_limit
         self.rng = rng or random.Random()
+        self._contempt_aware = bool(getattr(evaluator, "contempt", 0.0))
 
     # -- node preparation ---------------------------------------------------
     def _prepare(self, node: Node, use_tb: bool = True) -> Optional[float]:
@@ -244,10 +245,17 @@ class MCTS:
                 continue
             # evaluate each distinct leaf once (two paths may reach the same leaf)
             uniq: dict[int, Node] = {}
-            for path in pending_paths:
+            root_turn: dict[int, int] = {}
+            for path, i in zip(pending_paths, pending_idx):
                 uniq.setdefault(id(path[-1]), path[-1])
+                root_turn[id(path[-1])] = roots[i].pos.turn
             leaves = list(uniq.values())
-            results = self.eval([n.pos for n in leaves], [n.moves for n in leaves])
+            if self._contempt_aware:
+                # evaluators with draw contempt need to know which side owns each tree
+                results = self.eval([n.pos for n in leaves], [n.moves for n in leaves],
+                                    [root_turn[id(n)] for n in leaves])
+            else:
+                results = self.eval([n.pos for n in leaves], [n.moves for n in leaves])
             val_by_id = {}
             for n, (prior, value) in zip(leaves, results):
                 n.prior = prior

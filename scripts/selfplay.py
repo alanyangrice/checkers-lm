@@ -47,6 +47,17 @@ def main() -> None:
     ap.add_argument("--endgame-start-frac", type=float, default=0.0,
                     help="fraction of self-play games started from a random 5-8 piece endgame instead of the start position")
     ap.add_argument("--endgame-pieces", type=int, nargs=2, default=(5, 8), metavar=("MIN", "MAX"))
+    ap.add_argument("--dirichlet-alpha", type=float, default=1.2, help="root noise concentration (AlphaZero: ~10/branching)")
+    ap.add_argument("--dirichlet-eps", type=float, default=0.35)
+    ap.add_argument("--contempt", type=float, default=0.0,
+                    help="Lc0-style search-time draw contempt in self-play: v = P(w)-P(l)-c*P(d) for the root side")
+    ap.add_argument("--asym-start-frac", type=float, default=0.0,
+                    help="fraction of games started from a random position with one side strictly ahead on material")
+    ap.add_argument("--asym-weak", type=int, nargs=2, default=(3, 9), metavar=("MIN", "MAX"))
+    ap.add_argument("--asym-extra", type=int, default=5, help="strong side has weak+1 .. weak+extra pieces (cap 12)")
+    ap.add_argument("--regret-start-frac", type=float, default=0.0,
+                    help="fraction of games started from positions where search misjudged the outcome by > --regret-threshold")
+    ap.add_argument("--regret-threshold", type=float, default=0.5)
     ap.add_argument("--no-tb-draw-rules", action="store_true",
                     help="score tablebase wins as wins even when DTM exceeds the active draw rule's ply limit")
     ap.add_argument("--anchor", default=None, help="fixed reference checkpoint played at every gate (vs_anchor)")
@@ -59,7 +70,10 @@ def main() -> None:
                          max_plies=a.max_plies, seed=a.seed, autocast=not a.no_autocast,
                          gate_revert=a.gate_revert, tb_rescore=a.tb_rescore,
                          endgame_start_frac=a.endgame_start_frac, endgame_pieces=tuple(a.endgame_pieces),
-                         anchor=a.anchor, anchor_games=a.anchor_games, tb_draw_rules=not a.no_tb_draw_rules)
+                         anchor=a.anchor, anchor_games=a.anchor_games, tb_draw_rules=not a.no_tb_draw_rules,
+                         dirichlet_alpha=a.dirichlet_alpha, dirichlet_eps=a.dirichlet_eps, contempt=a.contempt,
+                         asym_start_frac=a.asym_start_frac, asym_weak=tuple(a.asym_weak), asym_extra=a.asym_extra,
+                         regret_start_frac=a.regret_start_frac, regret_threshold=a.regret_threshold)
     mcfg = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128) if a.small else ModelConfig()
     run(a.out, a.rounds, cfg, mcfg, tb_dir=a.tb, device=a.device, resume=a.resume, resume_buffer=a.resume_buffer)
 

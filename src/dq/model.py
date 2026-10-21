@@ -156,15 +156,23 @@ class NetEvaluator:
     softmax over the legal (from, to) pairs; moves sharing a pair split its
     mass equally."""
 
-    def __init__(self, model: SquareTransformer, device=None, autocast: bool = False) -> None:
+    def __init__(self, model: SquareTransformer, device=None, autocast: bool = False,
+                 contempt: float = 0.0) -> None:
+        """``contempt``: Lc0-style WDL draw contempt (v0.30+).  The value handed to the search
+        is ``P(win) - P(loss) - c * P(draw)`` when the leaf's side to move is the side that owns
+        the search (the root player), and ``+ c * P(draw)`` otherwise, so the backup stays
+        zero-sum: the root player avoids draws, its opponent is assumed to want them.  Labels
+        are never touched; this only steers play.  Requires the caller to pass ``root_turns``."""
         self.model = model.eval()
         self.device = device or next(model.parameters()).device
         self.autocast = autocast and self.device.type == "cuda"
+        self.contempt = contempt
         self.calls = 0
         self.positions = 0
 
     @torch.no_grad()
-    def __call__(self, positions: list[Position], moves: list[list[Move]]) -> list[tuple[dict[Move, float], float]]:
+    def __call__(self, positions: list[Position], moves: list[list[Move]],
+                 root_turns: list[int] | None = None) -> list[tuple[dict[Move, float], float]]:
         B = len(positions)
         self.calls += 1
         self.positions += B
@@ -173,7 +181,12 @@ class NetEvaluator:
             out = self.model(ids)
         logits = out["policy"].float()
         wdl = torch.softmax(out["wdl"].float(), dim=-1)
-        values = (wdl[:, WDL_W] - wdl[:, WDL_L]).tolist()
+        v = wdl[:, WDL_W] - wdl[:, WDL_L]
+        if self.contempt and root_turns is not None:
+            sign = torch.tensor([1.0 if p.turn == rt else -1.0 for p, rt in zip(positions, root_turns)],
+                                device=v.device)
+            v = v - self.contempt * wdl[:, WDL_D] * sign
+        values = v.tolist()
         # gather legal-pair logits with a padded index matrix and one softmax
         idx_lists = [[pair_index(pov_move(m, p.turn)) for m in ms] for p, ms in zip(positions, moves)]
         L = max(len(x) for x in idx_lists)
