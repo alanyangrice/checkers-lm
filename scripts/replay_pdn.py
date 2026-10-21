@@ -16,7 +16,7 @@ from dq.pdn import consistent_result, read_pdn, replay
 
 
 def main(path: str) -> int:
-    games = read_pdn(Path(path).read_text())
+    games = read_pdn(Path(path).read_text(encoding="utf-8"))
     c: Counter[str] = Counter()
     fails = []
     for g in games:

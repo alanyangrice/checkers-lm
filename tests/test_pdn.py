@@ -47,7 +47,7 @@ def test_ambiguous_short_form_resolved_by_continuation() -> None:
 
 @pytest.mark.skipif(not DATA.exists(), reason="lidraughts export not present")
 def test_lidraughts_games_replay() -> None:
-    games = read_pdn(DATA.read_text())
+    games = read_pdn(DATA.read_text(encoding="utf-8"))
     assert len(games) >= 500
     bad = []
     checked = 0
