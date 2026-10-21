@@ -41,13 +41,19 @@ def main() -> None:
     ap.add_argument("--no-autocast", action="store_true")
     ap.add_argument("--gate-revert", action="store_true", help="revert to the previous checkpoint when a gate fails")
     ap.add_argument("--small", action="store_true", help="tiny model for smoke tests")
+    ap.add_argument("--tb-rescore", action="store_true",
+                    help="use exact tablebase WDL as the value target for covered positions (Lc0-style rescoring)")
+    ap.add_argument("--endgame-start-frac", type=float, default=0.0,
+                    help="fraction of self-play games started from a random 5-8 piece endgame instead of the start position")
+    ap.add_argument("--endgame-pieces", type=int, nargs=2, default=(5, 8), metavar=("MIN", "MAX"))
     a = ap.parse_args()
     cfg = SelfPlayConfig(workers=a.workers, games_per_worker=a.games_per_worker, simulations=a.sims,
                          leaves_per_tree=a.leaves_per_tree, round_seconds=a.round_seconds,
                          min_buffer=a.min_buffer, train_steps_per_round=a.train_steps, batch_size=a.batch,
                          lr=a.lr, gate_every=a.gate_every, eval_games=a.eval_games, eval_sims=a.eval_sims,
                          max_plies=a.max_plies, seed=a.seed, autocast=not a.no_autocast,
-                         gate_revert=a.gate_revert)
+                         gate_revert=a.gate_revert, tb_rescore=a.tb_rescore,
+                         endgame_start_frac=a.endgame_start_frac, endgame_pieces=tuple(a.endgame_pieces))
     mcfg = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128) if a.small else ModelConfig()
     run(a.out, a.rounds, cfg, mcfg, tb_dir=a.tb, device=a.device, resume=a.resume)
 

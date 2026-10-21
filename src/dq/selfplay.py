@@ -64,6 +64,9 @@ class SelfPlayConfig:
     dirichlet_alpha: float = 0.3
     dirichlet_eps: float = 0.25
     tree_reuse: bool = True
+    endgame_start_frac: float = 0.0     # fraction of games started from a random endgame position (KataGo-style mixed starts)
+    endgame_pieces: tuple[int, int] = (5, 8)   # total piece count range for those starts (must exceed tablebase coverage)
+    tb_rescore: bool = False            # replace game-outcome value targets with exact tablebase WDL where covered (Lc0-style)
     # training
     replay_buffer: int = 500_000
     min_buffer: int = 5_000
@@ -97,9 +100,39 @@ class _Game:
         self.records: list[tuple[Position, dict]] = []
 
 
-def _finish(g: _Game) -> list[Example]:
+def _finish(g: _Game, tb: Tablebase | None = None) -> list[Example]:
+    """Turn a finished game into training examples.
+
+    With ``tb``, positions the tablebase covers get the exact WDL for the side to move as
+    their value target instead of the (possibly misplayed) game outcome — the "tablebase
+    rescoring" used by Leela Chess Zero.
+    """
     z_white = {1.0: 1.0, 0.5: 0.0, 0.0: -1.0}[g.state.result]
-    return [make_example(p, pi, z_white if p.turn == WHITE else -z_white) for p, pi in g.records]
+    out: list[Example] = []
+    for p, pi in g.records:
+        z = z_white if p.turn == WHITE else -z_white
+        if tb is not None and tb.covers(p):
+            r = tb.probe(p)
+            if r is not None:
+                z = float(r[0])          # WIN=1, DRAW=0, LOSS=-1, already side-to-move relative
+        out.append(make_example(p, pi, z))
+    return out
+
+
+def _start_position(cfg: SelfPlayConfig, rng: random.Random, tb: Tablebase | None) -> Position:
+    """Initial position for a new self-play game: the standard start, or (with probability
+    ``cfg.endgame_start_frac``) a random legal endgame with a piece count above tablebase
+    coverage, so search can resolve it exactly while the net still has to judge it."""
+    if cfg.endgame_start_frac <= 0 or rng.random() >= cfg.endgame_start_frac:
+        return Position.start()
+    lo, hi = cfg.endgame_pieces
+    for _ in range(50):
+        total = rng.randint(lo, hi)
+        n_white = rng.randint(max(1, total - (total // 2 + 1)), min(total - 1, total // 2 + 1))
+        pos = random_position(rng, n_white, total - n_white)
+        if (tb is None or not tb.covers(pos)) and legal_moves(pos) and not GameState(pos).over:
+            return pos
+    return Position.start()
 
 
 def _register_stack_dump() -> None:
@@ -123,7 +156,8 @@ def worker_loop(wid: int, cfg: SelfPlayConfig, mcfg: ModelConfig, weights_dir: s
     sc = SearchConfig(simulations=cfg.simulations, dirichlet_alpha=cfg.dirichlet_alpha,
                       dirichlet_eps=cfg.dirichlet_eps, leaves_per_tree=cfg.leaves_per_tree)
     mcts = MCTS(ev, sc, tablebase=tb, rng=rng)
-    games = [_Game(mcts, Position.start()) for _ in range(cfg.games_per_worker)]
+    tb_score = tb if cfg.tb_rescore else None
+    games = [_Game(mcts, _start_position(cfg, rng, tb)) for _ in range(cfg.games_per_worker)]
     t_last = time.time(); n_games = 0; n_moves = 0
     results = {"white": 0, "draw": 0, "black": 0}
     reasons: dict[str, int] = {}
@@ -144,11 +178,11 @@ def worker_loop(wid: int, cfg: SelfPlayConfig, mcfg: ModelConfig, weights_dir: s
             if g.state.over or len(g.state.history) >= cfg.max_plies:
                 if not g.state.over:
                     g.state.result, g.state.reason = 0.5, "max plies"
-                finished.extend(_finish(g))
+                finished.extend(_finish(g, tb_score))
                 n_games += 1
                 results[{1.0: "white", 0.5: "draw", 0.0: "black"}[g.state.result]] += 1
                 reasons[g.state.reason] = reasons.get(g.state.reason, 0) + 1
-                games[i] = _Game(mcts, Position.start())
+                games[i] = _Game(mcts, _start_position(cfg, rng, tb))
             else:
                 g.root = MCTS.advance(g.root, mv) if cfg.tree_reuse else Node(g.state.pos)
         if finished:
