@@ -42,6 +42,12 @@ def main() -> None:
     ap.add_argument("--no-autocast", action="store_true")
     ap.add_argument("--gate-revert", action="store_true", help="revert to the previous checkpoint when a gate fails")
     ap.add_argument("--small", action="store_true", help="tiny model for smoke tests")
+    ap.add_argument("--d-model", type=int, default=256)
+    ap.add_argument("--n-layers", type=int, default=6)
+    ap.add_argument("--n-heads", type=int, default=8)
+    ap.add_argument("--d-ff", type=int, default=1024)
+    ap.add_argument("--lr-min", type=float, default=None, help="cosine-decay floor (default: constant lr)")
+    ap.add_argument("--lr-decay-rounds", type=int, default=0, help="rounds over which lr decays to --lr-min")
     ap.add_argument("--tb-rescore", action="store_true",
                     help="use exact tablebase WDL as the value target for covered positions (Lc0-style rescoring)")
     ap.add_argument("--endgame-start-frac", type=float, default=0.0,
@@ -73,8 +79,10 @@ def main() -> None:
                          anchor=a.anchor, anchor_games=a.anchor_games, tb_draw_rules=not a.no_tb_draw_rules,
                          dirichlet_alpha=a.dirichlet_alpha, dirichlet_eps=a.dirichlet_eps, contempt=a.contempt,
                          asym_start_frac=a.asym_start_frac, asym_weak=tuple(a.asym_weak), asym_extra=a.asym_extra,
-                         regret_start_frac=a.regret_start_frac, regret_threshold=a.regret_threshold)
-    mcfg = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128) if a.small else ModelConfig()
+                         regret_start_frac=a.regret_start_frac, regret_threshold=a.regret_threshold,
+                         lr_min=a.lr if a.lr_min is None else a.lr_min, lr_decay_rounds=a.lr_decay_rounds)
+    mcfg = (ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128) if a.small
+            else ModelConfig(d_model=a.d_model, n_layers=a.n_layers, n_heads=a.n_heads, d_ff=a.d_ff))
     run(a.out, a.rounds, cfg, mcfg, tb_dir=a.tb, device=a.device, resume=a.resume, resume_buffer=a.resume_buffer)
 
 

@@ -87,6 +87,27 @@ class SquareTransformer(nn.Module):
         return sum(p.numel() for p in self.parameters())
 
 
+def infer_config(state_dict: dict, n_heads: int | None = None) -> ModelConfig:
+    """Recover ``ModelConfig`` from a saved state_dict (width, depth and FF size are visible in
+    the tensor shapes; the head count is not, so it is taken from ``n_heads`` or chosen as the
+    largest of 8/6/4 that divides d_model)."""
+    d = state_dict["tok.weight"].shape[1]
+    layers = {int(k.split(".")[2]) for k in state_dict if k.startswith("blocks.layers.")}
+    n_layers = max(layers) + 1
+    d_ff = state_dict["blocks.layers.0.linear1.weight"].shape[0]
+    if n_heads is None:
+        n_heads = next(h for h in (8, 6, 4, 2, 1) if d % h == 0)
+    return ModelConfig(d_model=d, n_layers=n_layers, n_heads=n_heads, d_ff=d_ff)
+
+
+def load_model(path, device, n_heads: int | None = None) -> "SquareTransformer":
+    """Build a model of the right size for a checkpoint and load it (eval mode)."""
+    sd = torch.load(path, map_location=device)
+    m = SquareTransformer(infer_config(sd, n_heads)).to(device)
+    m.load_state_dict(sd)
+    return m.eval()
+
+
 # ---------------------------------------------------------------------------
 # training examples
 # ---------------------------------------------------------------------------

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import faulthandler
 import json
+import math
 import os
 import pickle
 import signal
@@ -44,7 +45,7 @@ import torch.multiprocessing as mp
 from dq.game import GameState, draw_ply_limit
 from dq.mcts import MCTS, Node, SearchConfig
 from dq.model import (
-    WDL_D, WDL_L, WDL_W, Example, ModelConfig, NetEvaluator, SquareTransformer, collate, loss_fn,
+    WDL_D, WDL_L, WDL_W, Example, ModelConfig, NetEvaluator, SquareTransformer, collate, load_model, loss_fn,
     make_example,
 )
 from dq.rules import WHITE, Position, legal_moves, random_position
@@ -88,6 +89,8 @@ class SelfPlayConfig:
     train_steps_per_round: int = 200
     batch_size: int = 512
     lr: float = 1e-3
+    lr_min: float = 1e-3                # cosine-decay floor; equal to lr => constant
+    lr_decay_rounds: int = 0            # rounds over which lr decays to lr_min (0 => constant)
     weight_decay: float = 1e-4
     round_seconds: float = 60.0         # trainer drains the queue for this long per round
     # gating
@@ -295,6 +298,14 @@ def _load_latest(model: SquareTransformer, weights_dir: str, have: int, dev) -> 
 # trainer
 # ---------------------------------------------------------------------------
 
+def lr_at(cfg: SelfPlayConfig, rnd: int) -> float:
+    """Cosine decay from ``lr`` to ``lr_min`` over ``lr_decay_rounds`` rounds, then flat."""
+    if cfg.lr_decay_rounds <= 0 or cfg.lr_min >= cfg.lr:
+        return cfg.lr
+    t = min(rnd / cfg.lr_decay_rounds, 1.0)
+    return cfg.lr_min + 0.5 * (cfg.lr - cfg.lr_min) * (1 + math.cos(math.pi * t))
+
+
 def train_steps(model, opt, buffer: list[Example], cfg: SelfPlayConfig, device, rng: random.Random) -> dict[str, float]:
     model.train()
     agg: dict[str, float] = {}
@@ -471,8 +482,8 @@ def run(out_dir: str | Path, rounds: int, cfg: SelfPlayConfig, mcfg: ModelConfig
     tb = Tablebase.load(tb_dir) if tb_dir else None
     anchor = None
     if cfg.anchor:
-        anchor = SquareTransformer(mcfg).to(device_t)
-        anchor.load_state_dict(torch.load(cfg.anchor, map_location=device_t)); anchor.eval()
+        anchor = load_model(cfg.anchor, device_t)        # may be a different size than the candidate
+        print(f"anchor {cfg.anchor}: {anchor.n_params():,} params", flush=True)
     (out / "config.json").write_text(json.dumps({"selfplay": asdict(cfg), "model": asdict(mcfg)}, indent=1))
     log = open(out / "log.jsonl", "a")
     print(f"device={dev_name} params={model.n_params():,} workers={cfg.workers}", flush=True)
@@ -512,11 +523,14 @@ def run(out_dir: str | Path, rounds: int, cfg: SelfPlayConfig, mcfg: ModelConfig
                 buffer.extend(payload); n_new += len(payload); n_games += 1
             buffer = buffer[-cfg.replay_buffer:]
             t_gen = time.time() - t0
+            lr_now = lr_at(cfg, rnd)
+            for pg in opt.param_groups:
+                pg["lr"] = lr_now
             losses = train_steps(model, opt, buffer, cfg, device_t, rng)
             t_train = time.time() - t0 - t_gen
             rec = {"round": rnd, "version": version, "new_games": n_games, "new_examples": n_new,
-                   "buffer": len(buffer), "loss": losses, "t_gen": round(t_gen, 1), "t_train": round(t_train, 1),
-                   "worker_stats": stats}
+                   "buffer": len(buffer), "loss": losses, "lr": lr_now, "t_gen": round(t_gen, 1),
+                   "t_train": round(t_train, 1), "worker_stats": stats}
             if (rnd + 1) % cfg.gate_every == 0:
                 ev_out = gate(model, prev, cfg, tb, device_t, rng, anchor)
                 promoted = ev_out["vs_prev"] >= cfg.promote_threshold

@@ -21,9 +21,9 @@ from dq.tablebase import Tablebase
 
 
 def load(path: str, device) -> NetEvaluator:
-    m = SquareTransformer(ModelConfig()).to(device)
-    m.load_state_dict(torch.load(path, map_location=device))
-    m.eval()
+    from dq.model import load_model
+    m = load_model(path, device)
+    print(f"{path}: {m.n_params():,} params", flush=True)
     return NetEvaluator(m, device)
 
 

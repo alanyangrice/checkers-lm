@@ -87,3 +87,35 @@ def test_overfits_tiny_batch() -> None:
         opt.zero_grad(); loss.backward(); opt.step()
         first = first or loss.item()
     assert loss.item() < first * 0.2
+
+
+def test_infer_config_roundtrip_and_cross_size_match(tmp_path) -> None:
+    """A checkpoint's architecture is recoverable from its state_dict, and models of different
+    sizes can be loaded side by side (the anchor gate plays a 5M net against a 17M one)."""
+    import random
+    import torch
+    from dq.model import ModelConfig, NetEvaluator, SquareTransformer, infer_config, load_model
+    from dq.selfplay import match
+
+    small = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128)
+    big = ModelConfig(d_model=96, n_layers=3, n_heads=8, d_ff=192)
+    for cfg in (small, big):
+        m = SquareTransformer(cfg)
+        got = infer_config(m.state_dict(), n_heads=cfg.n_heads)
+        assert (got.d_model, got.n_layers, got.d_ff) == (cfg.d_model, cfg.n_layers, cfg.d_ff)
+    torch.save(SquareTransformer(small).state_dict(), tmp_path / "s.pt")
+    torch.save(SquareTransformer(big).state_dict(), tmp_path / "b.pt")
+    a = load_model(tmp_path / "s.pt", torch.device("cpu"))
+    b = load_model(tmp_path / "b.pt", torch.device("cpu"))
+    assert a.cfg.d_model == 64 and b.cfg.d_model == 96
+    s = match(NetEvaluator(a), NetEvaluator(b), games=4, sims=4, tb=None, rng=random.Random(0), max_plies=40)
+    assert 0.0 <= s <= 1.0
+
+
+def test_lr_schedule() -> None:
+    from dq.selfplay import SelfPlayConfig, lr_at
+    c = SelfPlayConfig(lr=1e-3, lr_min=1e-4, lr_decay_rounds=100)
+    assert abs(lr_at(c, 0) - 1e-3) < 1e-12
+    assert abs(lr_at(c, 50) - 5.5e-4) < 1e-9
+    assert abs(lr_at(c, 100) - 1e-4) < 1e-12 and abs(lr_at(c, 500) - 1e-4) < 1e-12
+    assert lr_at(SelfPlayConfig(lr=2e-4), 50) == 2e-4

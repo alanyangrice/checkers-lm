@@ -55,8 +55,8 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = SquareTransformer(ModelConfig()).to(dev)
-    model.load_state_dict(torch.load(a.ckpt, map_location=dev)); model.eval()
+    from dq.model import load_model
+    model = load_model(a.ckpt, dev)
     tb = Tablebase.load(a.tb)
     rng = random.Random(a.seed)
 

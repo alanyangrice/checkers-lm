@@ -61,10 +61,15 @@ class DQSearcher:
     def __init__(self, weights: str | None = None, sims: int | None = None, tb_dir: str | None = None,
                  device: torch.device | None = None, mcfg: ModelConfig | None = None) -> None:
         self.device = device or _device()
-        self.model = SquareTransformer(mcfg or ModelConfig()).to(self.device)
-        weights = weights or os.environ.get("DQ_WEIGHTS", "runs/gen1/weights/latest.pt")
-        if weights and os.path.exists(weights):
-            self.model.load_state_dict(torch.load(weights, map_location=self.device))
+        if weights is None:                                      # "" means: no weights, random init
+            weights = os.environ.get("DQ_WEIGHTS", "runs/gen1/weights/latest.pt")
+        if weights and os.path.exists(weights) and mcfg is None:
+            from dq.model import load_model
+            self.model = load_model(weights, self.device)       # size inferred from the checkpoint
+        else:
+            self.model = SquareTransformer(mcfg or ModelConfig()).to(self.device)
+            if weights and os.path.exists(weights):
+                self.model.load_state_dict(torch.load(weights, map_location=self.device))
         self.model.eval()
         tb_dir = os.environ.get("DQ_TB", "data/tb") if tb_dir is None else tb_dir
         self.tb = Tablebase.load(tb_dir) if tb_dir and os.path.isdir(tb_dir) else None

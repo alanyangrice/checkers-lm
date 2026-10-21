@@ -18,9 +18,8 @@ from dq.tablebase import Tablebase
 
 
 def load(path, dev):
-    m = SquareTransformer(ModelConfig()).to(dev)
-    m.load_state_dict(torch.load(path, map_location=dev)); m.eval()
-    return NetEvaluator(m, dev)
+    from dq.model import load_model
+    return NetEvaluator(load_model(path, dev), dev)
 
 
 def main():
