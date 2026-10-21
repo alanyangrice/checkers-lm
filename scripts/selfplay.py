@@ -36,7 +36,8 @@ def main() -> None:
     ap.add_argument("--max-plies", type=int, default=300)
     ap.add_argument("--tb", default=None, help="tablebase directory (data/tb)")
     ap.add_argument("--device", default=None)
-    ap.add_argument("--resume", default=None)
+    ap.add_argument("--resume", default=None, help="weights checkpoint to start from")
+    ap.add_argument("--resume-buffer", default=None, help="replay buffer checkpoint (runs/<name>/buffer.pkl) to start from")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-autocast", action="store_true")
     ap.add_argument("--gate-revert", action="store_true", help="revert to the previous checkpoint when a gate fails")
@@ -60,7 +61,7 @@ def main() -> None:
                          endgame_start_frac=a.endgame_start_frac, endgame_pieces=tuple(a.endgame_pieces),
                          anchor=a.anchor, anchor_games=a.anchor_games, tb_draw_rules=not a.no_tb_draw_rules)
     mcfg = ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128) if a.small else ModelConfig()
-    run(a.out, a.rounds, cfg, mcfg, tb_dir=a.tb, device=a.device, resume=a.resume)
+    run(a.out, a.rounds, cfg, mcfg, tb_dir=a.tb, device=a.device, resume=a.resume, resume_buffer=a.resume_buffer)
 
 
 if __name__ == "__main__":

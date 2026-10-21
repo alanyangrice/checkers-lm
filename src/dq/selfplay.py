@@ -31,6 +31,7 @@ from __future__ import annotations
 import faulthandler
 import json
 import os
+import pickle
 import signal
 import random
 import time
@@ -382,8 +383,22 @@ def _publish(model, weights_dir: Path, version: int) -> None:
     (weights_dir / "version").write_text(str(version))
 
 
+def _save_buffer(buffer: list[Example], path: Path) -> None:
+    """Checkpoint the replay buffer (written atomically) so a restart doesn't start from empty."""
+    tmp = path.with_suffix(".pkl.tmp")
+    with open(tmp, "wb") as f:
+        pickle.dump(buffer, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, path)
+
+
+def _load_buffer(path: Path) -> list[Example]:
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
 def run(out_dir: str | Path, rounds: int, cfg: SelfPlayConfig, mcfg: ModelConfig | None = None,
-        tb_dir: str | None = None, device: str | None = None, resume: str | None = None) -> None:
+        tb_dir: str | None = None, device: str | None = None, resume: str | None = None,
+        resume_buffer: str | None = None) -> None:
     _register_stack_dump()   # kill -USR1 <pid> dumps all stacks to stderr (POSIX only)
     mcfg = mcfg or ModelConfig()
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
@@ -418,7 +433,11 @@ def run(out_dir: str | Path, rounds: int, cfg: SelfPlayConfig, mcfg: ModelConfig
         p.start()
 
     buffer: list[Example] = []
+    if resume_buffer:
+        buffer = _load_buffer(Path(resume_buffer))[-cfg.replay_buffer:]
+        print(f"resumed replay buffer: {len(buffer):,} examples from {resume_buffer}", flush=True)
     stats: dict[int, dict] = {}
+    n_champ = 0
     try:
         for rnd in range(rounds):
             t0 = time.time(); n_new = 0; n_games = 0; t_last_item = time.time()
@@ -449,14 +468,21 @@ def run(out_dir: str | Path, rounds: int, cfg: SelfPlayConfig, mcfg: ModelConfig
                 ev_out = gate(model, prev, cfg, tb, device_t, rng, anchor)
                 promoted = ev_out["vs_prev"] >= cfg.promote_threshold
                 rec["gate"] = ev_out; rec["promoted"] = promoted
-                if promoted or not cfg.gate_revert:
-                    prev.load_state_dict(model.state_dict())      # new reference for the next gate
-                    version += 1
-                    _publish(model, weights_dir, version)
-                    torch.save(model.state_dict(), out / f"gen_{version:03d}.pt")
-                else:
+                # champion-style reference: `prev` moves only when the candidate beats it, so a
+                # failed gate lets progress accumulate and the next gate measures a longer span.
+                # Training itself continues from the live weights unless --gate-revert.
+                if promoted:
+                    prev.load_state_dict(model.state_dict())
+                    n_champ += 1
+                    torch.save(model.state_dict(), out / f"champion_{n_champ:03d}_r{rnd + 1}.pt")
+                    rec["champion"] = n_champ
+                elif cfg.gate_revert:
                     model.load_state_dict(prev.state_dict())
                     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+                version += 1
+                _publish(model, weights_dir, version)
+                torch.save(model.state_dict(), out / f"gen_{version:03d}.pt")
+                _save_buffer(buffer, out / "buffer.pkl")
             else:
                 # publish continuously so workers track the live network (AlphaZero-style)
                 version += 1
