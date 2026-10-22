@@ -93,6 +93,11 @@ class SelfPlayConfig:
     lr_decay_rounds: int = 0            # rounds over which lr decays to lr_min (0 => constant)
     weight_decay: float = 1e-4
     round_seconds: float = 60.0         # trainer drains the queue for this long per round
+    # human-game auxiliary supervision (AlphaGo SL policy / Maia): each step adds a batch of
+    # human positions; policy fits the human move, WDL fits the game result at reduced weight
+    human_data: str | None = None       # pickle from scripts/human_sl.py build
+    human_frac: float = 0.25            # human batch size as a fraction of batch_size
+    human_wdl_weight: float = 0.5
     # gating
     gate_every: int = 5
     eval_games: int = 40
@@ -306,14 +311,33 @@ def lr_at(cfg: SelfPlayConfig, rnd: int) -> float:
     return cfg.lr_min + 0.5 * (cfg.lr - cfg.lr_min) * (1 + math.cos(math.pi * t))
 
 
-def train_steps(model, opt, buffer: list[Example], cfg: SelfPlayConfig, device, rng: random.Random) -> dict[str, float]:
+def _human_loss(model, rows, cfg: SelfPlayConfig, device) -> tuple[torch.Tensor, float]:
+    """Auxiliary loss on human positions: policy vs the human move (only where >1 legal move),
+    WDL vs the game result at ``human_wdl_weight``.  ``rows`` are (Example, has_policy) pairs."""
+    b = collate([e for e, _ in rows], device)
+    has_pol = torch.tensor([float(p) for _, p in rows], device=device)
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cfg.autocast and device.type == "cuda"):
+        out = model(b["ids"])
+    logp = torch.log_softmax(out["policy"].float(), -1)
+    l_pol = (-(b["policy"] * logp).sum(-1) * has_pol).sum() / has_pol.sum().clamp(min=1)
+    l_wdl = torch.nn.functional.cross_entropy(out["wdl"].float(), b["wdl"])
+    return l_pol + cfg.human_wdl_weight * l_wdl, l_pol.item()
+
+
+def train_steps(model, opt, buffer: list[Example], cfg: SelfPlayConfig, device, rng: random.Random,
+                human: list | None = None) -> dict[str, float]:
     model.train()
     agg: dict[str, float] = {}
+    n_h = int(cfg.batch_size * cfg.human_frac) if human else 0
     for _ in range(cfg.train_steps_per_round):
         batch = collate(rng.sample(buffer, min(cfg.batch_size, len(buffer))), device)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=cfg.autocast and device.type == "cuda"):
             out = model(batch["ids"])
         loss, parts = loss_fn({k: v.float() for k, v in out.items()}, batch)
+        if n_h:
+            hl, hp = _human_loss(model, rng.sample(human, min(n_h, len(human))), cfg, device)
+            loss = loss + hl
+            parts["human_policy"] = hp
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -502,6 +526,11 @@ def run(out_dir: str | Path, rounds: int, cfg: SelfPlayConfig, mcfg: ModelConfig
         print(f"resumed replay buffer: {len(buffer):,} examples from {resume_buffer}", flush=True)
     stats: dict[int, dict] = {}
     n_champ = 0
+    human = None
+    if cfg.human_data:
+        with open(cfg.human_data, "rb") as f:
+            human = pickle.load(f)["train"]
+        print(f"human auxiliary data: {len(human):,} positions, {cfg.human_frac:.0%} of each batch", flush=True)
     try:
         for rnd in range(rounds):
             t0 = time.time(); n_new = 0; n_games = 0; t_last_item = time.time()
@@ -526,7 +555,7 @@ def run(out_dir: str | Path, rounds: int, cfg: SelfPlayConfig, mcfg: ModelConfig
             lr_now = lr_at(cfg, rnd)
             for pg in opt.param_groups:
                 pg["lr"] = lr_now
-            losses = train_steps(model, opt, buffer, cfg, device_t, rng)
+            losses = train_steps(model, opt, buffer, cfg, device_t, rng, human)
             t_train = time.time() - t0 - t_gen
             rec = {"round": rnd, "version": version, "new_games": n_games, "new_examples": n_new,
                    "buffer": len(buffer), "loss": losses, "lr": lr_now, "t_gen": round(t_gen, 1),

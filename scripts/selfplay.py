@@ -66,6 +66,9 @@ def main() -> None:
     ap.add_argument("--regret-threshold", type=float, default=0.5)
     ap.add_argument("--no-tb-draw-rules", action="store_true",
                     help="score tablebase wins as wins even when DTM exceeds the active draw rule's ply limit")
+    ap.add_argument("--human-data", default=None, help="human positions pickle (scripts/human_sl.py build) for auxiliary supervision")
+    ap.add_argument("--human-frac", type=float, default=0.25)
+    ap.add_argument("--human-wdl-weight", type=float, default=0.5)
     ap.add_argument("--anchor", default=None, help="fixed reference checkpoint played at every gate (vs_anchor)")
     ap.add_argument("--anchor-games", type=int, default=100)
     a = ap.parse_args()
@@ -80,7 +83,8 @@ def main() -> None:
                          dirichlet_alpha=a.dirichlet_alpha, dirichlet_eps=a.dirichlet_eps, contempt=a.contempt,
                          asym_start_frac=a.asym_start_frac, asym_weak=tuple(a.asym_weak), asym_extra=a.asym_extra,
                          regret_start_frac=a.regret_start_frac, regret_threshold=a.regret_threshold,
-                         lr_min=a.lr if a.lr_min is None else a.lr_min, lr_decay_rounds=a.lr_decay_rounds)
+                         lr_min=a.lr if a.lr_min is None else a.lr_min, lr_decay_rounds=a.lr_decay_rounds,
+                         human_data=a.human_data, human_frac=a.human_frac, human_wdl_weight=a.human_wdl_weight)
     mcfg = (ModelConfig(d_model=64, n_layers=2, n_heads=4, d_ff=128) if a.small
             else ModelConfig(d_model=a.d_model, n_layers=a.n_layers, n_heads=a.n_heads, d_ff=a.d_ff))
     run(a.out, a.rounds, cfg, mcfg, tb_dir=a.tb, device=a.device, resume=a.resume, resume_buffer=a.resume_buffer)
