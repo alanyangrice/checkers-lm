@@ -19,17 +19,24 @@ UA = "checkers-lm research fetch (contact: github.com/alanyangrice/checkers-lm)"
 
 
 def get(url: str, accept: str) -> str:
+    import http.client
     req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": UA})
     for attempt in range(6):
         try:
-            with urllib.request.urlopen(req, timeout=120) as r:
+            with urllib.request.urlopen(req, timeout=180) as r:
                 return r.read().decode("utf-8", "replace")
+        except http.client.IncompleteRead as e:
+            # the server closes long streams early; keep what arrived (whole games are re-split by the caller)
+            print(f"  stream cut after {len(e.partial)} bytes; keeping partial", flush=True)
+            return e.partial.decode("utf-8", "replace")
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 print("  429: backing off 65 s", flush=True); time.sleep(65); continue
             if e.code == 404:
                 return ""
             raise
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            print(f"  {type(e).__name__}: retrying in 20 s", flush=True); time.sleep(20)
     return ""
 
 
@@ -40,6 +47,7 @@ def main() -> None:
     ap.add_argument("--top", type=int, default=200)
     ap.add_argument("--max-per-user", type=int, default=1500)
     ap.add_argument("--min-rating", type=int, default=0, help="skip games where either player is below this")
+    ap.add_argument("--skip", type=int, default=0, help="resume: skip the first N players of the leaderboard")
     a = ap.parse_args()
 
     html = get(f"https://lidraughts.org/player/top/{a.top}/brazilian", "text/html")
@@ -47,7 +55,7 @@ def main() -> None:
     print(f"{len(names)} players", flush=True)
 
     seen: set[str] = set()
-    for f in a.merge:
+    for f in list(a.merge) + [a.out]:          # never re-add games already in the output file
         try:
             seen |= set(re.findall(r'\[Site "([^"]+)"\]', open(f, encoding="utf-8").read()))
         except FileNotFoundError:
@@ -57,6 +65,8 @@ def main() -> None:
     n_new = 0
     with open(a.out, "a", encoding="utf-8") as out:
         for i, u in enumerate(names):
+            if i < a.skip:
+                continue
             url = (f"https://lidraughts.org/api/games/user/{u}?perfType=brazilian&rated=true"
                    f"&max={a.max_per_user}&moves=true&tags=true&opening=false")
             txt = get(url, "application/x-chess-pgn")
