@@ -6,12 +6,18 @@ url: "https://lidraughts.org/"
 engine:
   dir: "./"
   name: "DQEngine"           # class name in strategies.py (from dq_engine import DQEngine)
+  engine_argument: ""
   working_dir: "./"
   protocol: "homemade"
   ponder: false
   draw_or_resign:
     resign_enabled: false
+    resign_score: -1000
+    resign_moves: 3
     offer_draw_enabled: false
+    offer_draw_score: 0
+    offer_draw_moves: 5
+    offer_draw_pieces: 10
   homemade_options:
   silence_stderr: false
 
